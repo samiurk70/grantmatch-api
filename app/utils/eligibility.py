@@ -1,47 +1,74 @@
-"""Rule-based eligibility checks for each grant type."""
+"""Rule-based eligibility checks — returns a verdict and the top factors."""
 from __future__ import annotations
 
+from typing import Literal
+
 from app.models.db_models import Grant
-from app.models.schemas import ApplicantProfile, EligibilitySignal
+from app.models.schemas import ApplicantProfile, FactorExplanation
+
+EligibilityVerdict = Literal["likely_eligible", "check_required", "likely_ineligible"]
 
 
-def check_eligibility(grant: Grant, profile: ApplicantProfile) -> list[EligibilitySignal]:
-    """Return a list of eligibility signals for a grant-profile pair."""
-    signals: list[EligibilitySignal] = []
+def check_eligibility(
+    grant: Grant,
+    profile: ApplicantProfile,
+) -> tuple[EligibilityVerdict, list[FactorExplanation]]:
+    """
+    Run rule-based eligibility checks for a grant–profile pair.
 
-    # TRL range check
-    if grant.trl_min is not None and profile.trl is not None:
-        met = profile.trl >= grant.trl_min
-        signals.append(EligibilitySignal(
-            rule="trl_min",
-            met=met,
-            detail=f"Required TRL >= {grant.trl_min}, applicant TRL = {profile.trl}",
+    Returns a (verdict, factors) tuple where factors are the signals that
+    drove the verdict, suitable for inclusion in GrantMatch.top_factors.
+    """
+    factors: list[FactorExplanation] = []
+
+    # --- TRL range ---
+    if grant.eligibility_trl and profile.trl is not None:
+        trl_min, trl_max = grant.eligibility_trl[0], grant.eligibility_trl[-1]
+        in_range = trl_min <= profile.trl <= trl_max
+        factors.append(FactorExplanation(
+            factor_name="trl_match",
+            direction="positive" if in_range else "negative",
+            impact=0.8 if in_range else 0.7,
         ))
 
-    if grant.trl_max is not None and profile.trl is not None:
-        met = profile.trl <= grant.trl_max
-        signals.append(EligibilitySignal(
-            rule="trl_max",
-            met=met,
-            detail=f"Required TRL <= {grant.trl_max}, applicant TRL = {profile.trl}",
+    # --- Organisation type ---
+    if grant.eligibility_org_types:
+        org_match = profile.organisation_type in grant.eligibility_org_types
+        factors.append(FactorExplanation(
+            factor_name="org_type_match",
+            direction="positive" if org_match else "negative",
+            impact=0.9 if org_match else 0.8,
         ))
 
-    # Region check
-    if grant.region and profile.region:
-        met = grant.region.lower() in ("both", profile.region.lower())
-        signals.append(EligibilitySignal(
-            rule="region",
-            met=met,
-            detail=f"Grant region: {grant.region}, applicant region: {profile.region}",
+    # --- Sector overlap ---
+    if grant.eligibility_sectors and profile.sectors:
+        overlap = set(profile.sectors) & set(grant.eligibility_sectors)
+        sector_match = bool(overlap)
+        factors.append(FactorExplanation(
+            factor_name="sector_overlap",
+            direction="positive" if sector_match else "negative",
+            impact=round(len(overlap) / max(len(profile.sectors), 1), 2),
         ))
 
-    # Award size check
-    if grant.max_award_gbp is not None and profile.max_grant_size_gbp is not None:
-        met = grant.max_award_gbp <= profile.max_grant_size_gbp
-        signals.append(EligibilitySignal(
-            rule="award_size",
-            met=met,
-            detail=f"Grant max award: £{grant.max_award_gbp:,.0f}, requested max: £{profile.max_grant_size_gbp:,.0f}",
+    # --- Region ---
+    if grant.eligibility_regions:
+        region_match = (
+            profile.location in grant.eligibility_regions
+            or "international" in grant.eligibility_regions
+        )
+        factors.append(FactorExplanation(
+            factor_name="region_match",
+            direction="positive" if region_match else "negative",
+            impact=0.85 if region_match else 0.75,
         ))
 
-    return signals
+    # --- Derive verdict from negative signals ---
+    negatives = sum(1 for f in factors if f.direction == "negative")
+    if negatives == 0:
+        verdict: EligibilityVerdict = "likely_eligible"
+    elif negatives <= 1:
+        verdict = "check_required"
+    else:
+        verdict = "likely_ineligible"
+
+    return verdict, factors

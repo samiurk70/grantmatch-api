@@ -4,11 +4,17 @@ from app.models.schemas import ApplicantProfile
 from app.services.matcher import match_grants
 
 
+PROFILE = ApplicantProfile(
+    organisation_name="Acme Ltd",
+    organisation_type="sme",
+    description="We develop AI-powered precision agriculture tools to reduce water usage.",
+    sectors=["ai", "agritech"],
+    location="england",
+    trl=4,
+)
+
+
 @pytest.mark.asyncio
 async def test_match_grants_not_implemented():
-    profile = ApplicantProfile(
-        organisation_name="Acme Ltd",
-        description="We develop AI tools for agriculture.",
-    )
     with pytest.raises(NotImplementedError):
-        await match_grants(profile, top_k=5)
+        await match_grants(PROFILE, top_k=5)

@@ -2,14 +2,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.database import init_db
+from app.database import create_all_tables
 from app.api.routes import router
 from app.services.embedder import get_embedder
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    await create_all_tables()
     get_embedder()  # warm up the embedding model at startup
     yield
 

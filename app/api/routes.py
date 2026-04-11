@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
 
 from app.config import get_settings
-from app.models.schemas import MatchRequest, MatchResponse
+from app.models.schemas import ApplicantProfile, MatchResponse
 from app.services.matcher import match_grants
 
 router = APIRouter()
@@ -17,6 +17,6 @@ def verify_api_key(api_key: str = Security(_api_key_header)) -> str:
 
 
 @router.post("/match", response_model=MatchResponse, dependencies=[Depends(verify_api_key)])
-async def match(request: MatchRequest) -> MatchResponse:
+async def match(profile: ApplicantProfile) -> MatchResponse:
     """Accept an applicant profile and return ranked grant matches."""
-    return await match_grants(request.profile, request.top_k)
+    return await match_grants(profile, profile.top_n or 10)
