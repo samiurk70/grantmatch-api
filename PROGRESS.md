@@ -1,7 +1,7 @@
 # GrantMatch API — Session Progress Backup
 
 ## Status
-Phase 3 complete. 6/6 tests passing.
+Phase 4 complete. 25/25 tests passing.
 
 ## Environment
 - Python 3.14.3 on Windows
@@ -51,19 +51,33 @@ docker-compose.yml created but Docker not used for local dev.
 - FAISS IndexIDMap — Grant.id integers map directly to DB rows
 - All ingestion scripts runnable standalone as python -m data.ingest.X
 - Heuristic scorer used until ml/model.pkl exists
-- matcher.py currently raises NotImplementedError (Phase 4 implements it)
-- reranker.py currently raises NotImplementedError (Phase 4 implements it)
+- matcher.py: full 8-step pipeline implemented (Phase 4)
+- reranker.py: heuristic fallback active, XGBoost loads when model.pkl exists
 
-## Next: Phase 4
-Implement:
-- app/services/embedder.py: SentenceEmbedder singleton
-- app/services/matcher.py: full GrantMatcher with FAISS retrieval,
-  eligibility filter, reranker scoring
-- app/services/reranker.py: XGBoost model loader with heuristic fallback
-- app/api/routes.py: full endpoints including /v1/grants browse and 
-  /v1/grants/{id} detail
-- app/utils/eligibility.py: check_eligibility returning verdict + factors
-- app/utils/feature_extractor.py: 9-feature vector
+## Phase 4 Complete
+25/25 tests passing.
+
+Implemented:
+- app/utils/eligibility.py: check_eligibility() returns str verdict,
+  _location_compatible() handles UK/sub-region bidirectional matching
+- app/utils/feature_extractor.py: extract_features() returns dict[str,float],
+  FEATURE_NAMES module constant, features_to_array() for model input
+- app/services/embedder.py: SentenceEmbedder class, get_embedder() singleton
+- app/services/reranker.py: GrantReranker class, joblib model load,
+  heuristic weights sum to 100, _top3_factors() always returns exactly 3
+- app/services/matcher.py: full 8-step pipeline, IndexIDMap FAISS,
+  DB fallback when index absent
+- app/models/schemas.py: added GrantSummary for browse endpoints
+- app/api/routes.py: GET /api/v1/, GET /api/v1/health, GET /api/v1/grants,
+  GET /api/v1/grants/{id}, POST /api/v1/match all implemented
+- app/main.py: startup order embedder → reranker → matcher, CORS added,
+  /health at root for Docker probes
+
+## Next: Phase 5
+- ml/train.py: XGBoost XGBClassifier, 1500 synthetic pairs, 4 label classes
+- ml/evaluate.py: ndcg_at_k, mean_reciprocal_rank functions
+- Full test suite expansion (test_api.py and test_matcher.py already done)
+- README.md final version
 
 ## File Structure (complete)
 grantmatch-api/
