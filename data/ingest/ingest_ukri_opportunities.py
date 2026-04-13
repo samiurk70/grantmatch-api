@@ -4,8 +4,18 @@ Ingest live Innovate UK / UKRI competitions from the UKRI Opportunities page.
 Standalone usage:
     python -m data.ingest.ingest_ukri_opportunities
 
-We scrape the listing page for opportunity cards, then follow each
-card's detail link to fetch the full description.
+Card structure (WordPress, server-side rendered):
+  div.opportunity  — one card per opportunity
+    h3.entry-title > a.ukri-funding-opp__link  — title + detail URL
+    div.entry-content > p                       — short summary
+    dl.opportunity__summary  — metadata table:
+      dt "Opportunity status:" → dd > span  (text: Open/Upcoming/Closed)
+      dt "Funders:"            → dd > a.ukri-funder__link
+      dt "Total fund:"         → dd
+      dt "Opening date:"       → dd > time[datetime]
+      dt "Closing date:"       → dd > time[datetime]
+
+Pagination: a.next.page-numbers → href = .../opportunity/page/N/
 """
 from __future__ import annotations
 
@@ -15,7 +25,7 @@ import re
 from datetime import datetime
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0
 RETRY_ATTEMPTS = 3
-DETAIL_CONCURRENCY = 5  # simultaneous detail-page fetches
+DETAIL_CONCURRENCY = 5  # concurrent detail-page fetches
 
 
 def _slugify(text: str) -> str:
@@ -38,24 +48,31 @@ def _slugify(text: str) -> str:
     return text[:190]
 
 
-def _parse_date(text: str | None) -> datetime | None:
-    if not text:
+def _parse_date(value: str | None) -> datetime | None:
+    if not value:
         return None
-    text = re.sub(r"\s+", " ", text.strip())
-    for fmt in ("%d %B %Y", "%B %d, %Y", "%d/%m/%Y", "%Y-%m-%d", "%d %b %Y"):
+    value = value.strip()
+    # ISO datetime from the <time datetime="..."> attribute
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
         try:
-            return datetime.strptime(text, fmt)
+            return datetime.strptime(value[:19], fmt)
+        except ValueError:
+            continue
+    # Human-readable formats from the text content
+    for fmt in ("%d %B %Y", "%d %b %Y", "%B %d, %Y"):
+        try:
+            return datetime.strptime(re.sub(r"\s+", " ", value.split(" UK")[0].strip()), fmt)
         except ValueError:
             continue
     return None
 
 
 def _parse_gbp(text: str | None) -> float | None:
-    """Extract a numeric GBP amount from a string like '£2.5 million' or '£500,000'."""
+    """Extract a numeric GBP amount from strings like '£2.5 million' or '£500,000'."""
     if not text:
         return None
     text = text.replace(",", "").lower()
-    match = re.search(r"£\s*([\d.]+)\s*(m(?:illion)?|k(?:illion)?|b(?:illion)?)?", text)
+    match = re.search(r"£\s*([\d.]+)\s*(b(?:illion)?|m(?:illion)?|k)?", text)
     if not match:
         return None
     amount = float(match.group(1))
@@ -69,13 +86,118 @@ def _parse_gbp(text: str | None) -> float | None:
     return amount
 
 
-def _derive_status(open_date: datetime | None, close_date: datetime | None) -> str:
+def _dl_value(dl: Tag, label_text: str) -> Tag | None:
+    """
+    Find the <dd> that follows the <dt> whose text contains label_text
+    (case-insensitive) inside a dl.
+    """
+    for row in dl.select("div.govuk-table__row"):
+        dt = row.select_one("dt")
+        dd = row.select_one("dd")
+        if dt and dd and label_text.lower() in dt.get_text(strip=True).lower():
+            return dd
+    return None
+
+
+def _derive_status(
+    status_text: str | None,
+    open_date: datetime | None,
+    close_date: datetime | None,
+) -> str:
+    """Prefer the explicit status span; fall back to date-based derivation."""
+    if status_text:
+        s = status_text.strip().lower()
+        if s in ("open", "upcoming", "closed"):
+            return s
     now = datetime.utcnow()
     if close_date and close_date < now:
         return "closed"
     if open_date and open_date > now:
         return "upcoming"
     return "open"
+
+
+def _parse_listing_card(card: Tag) -> dict | None:
+    """Extract all available fields from a single opportunity listing card."""
+    try:
+        title_el = card.select_one("a.ukri-funding-opp__link")
+        if not title_el:
+            return None
+        title = title_el.get_text(strip=True)
+        url = title_el.get("href", "")
+        if url and not url.startswith("http"):
+            url = f"https://www.ukri.org{url}"
+
+        summary = ""
+        summary_el = card.select_one("div.entry-content p")
+        if summary_el:
+            summary = summary_el.get_text(strip=True)
+
+        # Metadata table
+        dl = card.select_one("dl.opportunity__summary")
+        status_text = funder = fund_text = None
+        open_date = close_date = None
+
+        if dl:
+            # Status
+            status_dd = _dl_value(dl, "Opportunity status")
+            if status_dd:
+                span = status_dd.select_one("span")
+                status_text = span.get_text(strip=True) if span else status_dd.get_text(strip=True)
+
+            # Funder
+            funder_dd = _dl_value(dl, "Funders")
+            if funder_dd:
+                funder_a = funder_dd.select_one("a.ukri-funder__link")
+                funder = (funder_a or funder_dd).get_text(strip=True)
+
+            # Total fund
+            fund_dd = _dl_value(dl, "Total fund")
+            if fund_dd:
+                fund_text = fund_dd.get_text(strip=True)
+
+            # Opening date
+            open_dd = _dl_value(dl, "Opening date")
+            if open_dd:
+                t = open_dd.select_one("time")
+                open_date = _parse_date(
+                    (t.get("datetime") if t else None) or open_dd.get_text(strip=True)
+                )
+
+            # Closing date
+            close_dd = _dl_value(dl, "Closing date")
+            if close_dd:
+                t = close_dd.select_one("time")
+                close_date = _parse_date(
+                    (t.get("datetime") if t else None) or close_dd.get_text(strip=True)
+                )
+
+        funding_max = _parse_gbp(fund_text)
+        status = _derive_status(status_text, open_date, close_date)
+        full_text = f"{title} {summary}"
+
+        return dict(
+            source="ukri_opportunity",
+            external_id=_slugify(title),
+            title=title[:500],
+            description=summary or None,
+            summary=summary[:200] if summary else None,
+            funder=funder or "UKRI",
+            programme="UKRI Opportunities",
+            funding_min=None,
+            funding_max=funding_max,
+            open_date=open_date,
+            deadline=close_date,
+            status=status,
+            eligibility_org_types=["sme", "startup", "university", "large_company"],
+            eligibility_sectors=extract_sectors_from_text(full_text),
+            eligibility_regions=["uk"],
+            eligibility_trl=None,
+            url=url,
+        )
+    except Exception as exc:
+        logger.warning("Failed to parse UKRI opportunity card: %s", exc)
+        return None
 
 
 async def _fetch_html(
@@ -89,154 +211,63 @@ async def _fetch_html(
             return BeautifulSoup(response.text, "lxml")
         except httpx.HTTPError as exc:
             last_exc = exc
-            logger.warning("Fetch %s attempt %d/%d failed: %s", label or url, attempt, RETRY_ATTEMPTS, exc)
+            logger.warning(
+                "Fetch %s attempt %d/%d failed: %s",
+                label or url, attempt, RETRY_ATTEMPTS, exc,
+            )
             await asyncio.sleep(2 ** attempt)
     logger.error("Giving up on %s: %s", label or url, last_exc)
     return None
 
 
-def _extract_funder(soup: BeautifulSoup) -> str:
-    """Try several selectors to find the funder name on a UKRI detail page."""
-    for selector in [
-        "[data-funder]",
-        ".opportunity-funder",
-        ".meta-item--funder",
-    ]:
-        el = soup.select_one(selector)
-        if el:
-            return el.get_text(strip=True)
-    # Fall back: look for "Funder:" label text
-    for label in soup.find_all(string=re.compile(r"funder", re.I)):
-        parent = label.parent
-        sibling = parent.find_next_sibling()
-        if sibling:
-            return sibling.get_text(strip=True)
-    return "UKRI"
-
-
-async def _fetch_detail(
+async def _enrich_from_detail(
     client: httpx.AsyncClient,
     card_data: dict,
     semaphore: asyncio.Semaphore,
 ) -> dict:
-    """Fetch the detail page for one opportunity and merge its content."""
+    """
+    Fetch the detail page to get the full description text.
+    Other metadata (dates, funder, fund) is already extracted from the
+    listing card and is not overwritten here.
+    """
     async with semaphore:
         detail_url = card_data.get("url", "")
         if not detail_url:
             return card_data
 
-        soup = await _fetch_html(client, detail_url, label=card_data.get("title", ""))
+        soup = await _fetch_html(
+            client, detail_url, label=card_data.get("title", "")
+        )
         if soup is None:
             return card_data
 
-        # Description: prefer the main article / opportunity body
+        # Try selectors for the full description on the detail page
         description = ""
         for selector in [
-            "article .opportunity-description",
-            ".opportunity-body",
-            "main article",
             ".wysiwyg-content",
-            "main p",
+            ".entry-content",
+            "main article",
+            "article .opportunity-description",
         ]:
             el = soup.select_one(selector)
             if el:
                 description = el.get_text(separator=" ", strip=True)
-                break
+                if len(description) > 100:
+                    break
 
         if not description:
-            # Last resort: all paragraphs in main
             paras = soup.select("main p")
             description = " ".join(p.get_text(strip=True) for p in paras[:10])
 
-        # Dates on detail page are more reliable
-        open_text = close_text = None
-        for el in soup.select(".opportunity-dates li, .meta-item, dl dt"):
-            label = el.get_text(strip=True).lower()
-            value_el = el.find_next_sibling() or el.parent.find("dd")
-            value = value_el.get_text(strip=True) if value_el else ""
-            if "open" in label or "opening" in label:
-                open_text = value
-            elif "clos" in label or "deadline" in label:
-                close_text = value
+        if description and len(description) > len(card_data.get("description") or ""):
+            full_text = f"{card_data['title']} {description}"
+            card_data.update(
+                description=description,
+                summary=description[:200],
+                eligibility_sectors=extract_sectors_from_text(full_text),
+            )
 
-        open_date = _parse_date(open_text) or card_data.get("open_date")
-        close_date = _parse_date(close_text) or card_data.get("deadline")
-        funder = _extract_funder(soup) or card_data.get("funder", "UKRI")
-
-        # Total fund amount
-        total_fund: float | None = card_data.get("funding_max")
-        for el in soup.select(".opportunity-fund, .meta-item--budget, [data-fund]"):
-            total_fund = _parse_gbp(el.get_text(strip=True)) or total_fund
-
-        full_text = f"{card_data['title']} {description}"
-        card_data.update(
-            description=description or card_data.get("description"),
-            summary=(description[:200] if description else card_data.get("summary")),
-            open_date=open_date,
-            deadline=close_date,
-            status=_derive_status(open_date, close_date),
-            funder=funder,
-            funding_max=total_fund,
-            eligibility_sectors=extract_sectors_from_text(full_text),
-        )
         return card_data
-
-
-def _parse_listing_card(card: BeautifulSoup, base_url: str) -> dict | None:
-    """Parse a single opportunity card from the listing page."""
-    try:
-        title_el = card.select_one("h2 a, h3 a, .opportunity-title a, a.opportunity-link")
-        if not title_el:
-            return None
-        title = title_el.get_text(strip=True)
-        href = title_el.get("href", "")
-        url = href if href.startswith("http") else f"https://www.ukri.org{href}"
-
-        summary = ""
-        summary_el = card.select_one("p, .opportunity-summary")
-        if summary_el:
-            summary = summary_el.get_text(strip=True)
-
-        funder = "UKRI"
-        funder_el = card.select_one(".opportunity-funder, [data-funder]")
-        if funder_el:
-            funder = funder_el.get_text(strip=True)
-
-        deadline_text = None
-        date_el = card.select_one("time, .opportunity-deadline, [data-deadline]")
-        if date_el:
-            deadline_text = date_el.get("datetime") or date_el.get_text(strip=True)
-
-        fund_text = None
-        fund_el = card.select_one(".opportunity-fund, [data-fund]")
-        if fund_el:
-            fund_text = fund_el.get_text(strip=True)
-
-        deadline = _parse_date(deadline_text)
-        funding_max = _parse_gbp(fund_text)
-        full_text = f"{title} {summary}"
-        return dict(
-            source="ukri_opportunity",
-            external_id=_slugify(title),
-            title=title[:500],
-            description=summary or None,
-            summary=summary[:200] if summary else None,
-            funder=funder,
-            programme="UKRI Opportunities",
-            funding_min=None,
-            funding_max=funding_max,
-            open_date=None,
-            deadline=deadline,
-            status=_derive_status(None, deadline),
-            eligibility_org_types=["sme", "startup", "university", "large_company"],
-            eligibility_sectors=extract_sectors_from_text(full_text),
-            eligibility_regions=["uk"],
-            eligibility_trl=None,
-            url=url,
-        )
-    except Exception as exc:
-        logger.warning("Failed to parse UKRI opportunity card: %s", exc)
-        return None
 
 
 async def _upsert(session: AsyncSession, data: dict) -> None:
@@ -260,8 +291,8 @@ async def ingest_ukri_opportunities(db_session: AsyncSession) -> int:
     """
     settings = get_settings()
     listing_url = settings.ukri_opportunities_url
-    total = 0
     semaphore = asyncio.Semaphore(DETAIL_CONCURRENCY)
+    total = 0
 
     async with httpx.AsyncClient(
         timeout=REQUEST_TIMEOUT,
@@ -269,41 +300,43 @@ async def ingest_ukri_opportunities(db_session: AsyncSession) -> int:
         headers={"User-Agent": "GrantMatch-Ingest/1.0 (research tool)"},
     ) as client:
         # Collect all pages of the listing
+        current_url: str | None = listing_url
         page = 1
         all_cards: list[dict] = []
-        while True:
-            params = {"page": page} if page > 1 else {}
-            soup = await _fetch_html(client, listing_url + ("" if not params else ""), label=f"listing page {page}")
+
+        while current_url:
+            soup = await _fetch_html(client, current_url, label=f"listing page {page}")
             if soup is None:
                 break
 
-            cards = (
-                soup.select("article.opportunity-card")
-                or soup.select("li.opportunity")
-                or soup.select(".opportunity-listing article")
-                or soup.select("div.card")
-            )
+            # Each opportunity is a <div class="... opportunity ...">
+            cards = soup.find_all("div", class_="opportunity")
             if not cards:
                 logger.info("UKRI Opportunities: no cards on page %d, stopping.", page)
                 break
 
             for card in cards:
-                data = _parse_listing_card(card, "https://www.ukri.org")
+                data = _parse_listing_card(card)
                 if data:
                     all_cards.append(data)
 
-            next_el = soup.select_one("a[rel='next'], .pagination__next a")
-            if not next_el:
-                break
+            logger.info(
+                "UKRI Opportunities: page %d — %d cards found (total so far: %d).",
+                page, len(cards), len(all_cards),
+            )
+
+            # Follow the "Next" pagination link
+            next_el = soup.select_one("a.next.page-numbers")
+            current_url = next_el["href"] if next_el else None
             page += 1
 
-        logger.info("UKRI Opportunities: found %d cards, fetching detail pages.", len(all_cards))
+        logger.info(
+            "UKRI Opportunities: %d listing cards found, enriching from detail pages.",
+            len(all_cards),
+        )
 
-        # Fetch all detail pages concurrently (bounded by semaphore)
-        tasks = [
-            _fetch_detail(client, card, semaphore)
-            for card in all_cards
-        ]
+        # Enrich with detail-page descriptions (bounded concurrency)
+        tasks = [_enrich_from_detail(client, card, semaphore) for card in all_cards]
         enriched = await asyncio.gather(*tasks)
 
         for data in enriched:

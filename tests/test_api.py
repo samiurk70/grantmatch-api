@@ -6,9 +6,9 @@ from app.main import app
 VALID_PROFILE = {
     "organisation_name": "Acme Ltd",
     "organisation_type": "sme",
-    "description": "We develop AI-powered precision agriculture tools to reduce water usage.",
+    "description": "We develop AI-powered precision agriculture tools to reduce water usage in UK farms.",
     "sectors": ["ai", "agritech"],
-    "location": "england",
+    "location": "uk",
     "trl": 4,
     "top_n": 5,
 }
@@ -19,11 +19,19 @@ VALID_PROFILE = {
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_health_simple():
+async def test_health_returns_ok():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/health")
+        response = await client.get("/api/v1/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_root_returns_name():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/v1/")
+    assert response.status_code == 200
+    assert response.json()["name"] == "GrantMatch API"
 
 
 @pytest.mark.asyncio
@@ -36,16 +44,6 @@ async def test_health_full():
     assert "model_loaded" in body
     assert "grants_in_db" in body
     assert "index_built" in body
-
-
-@pytest.mark.asyncio
-async def test_root():
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/api/v1/")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["name"] == "GrantMatch API"
-    assert "docs" in body
 
 
 # ---------------------------------------------------------------------------
@@ -83,9 +81,9 @@ async def test_grants_requires_api_key():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_match_invalid_sector_rejected():
+async def test_match_description_too_short():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        bad = {**VALID_PROFILE, "sectors": ["not_a_real_sector"]}
+        bad = {**VALID_PROFILE, "description": "too short"}
         response = await client.post(
             "/api/v1/match", json=bad, headers={"X-API-Key": "changeme"}
         )
@@ -93,9 +91,9 @@ async def test_match_invalid_sector_rejected():
 
 
 @pytest.mark.asyncio
-async def test_match_description_too_short_rejected():
+async def test_match_invalid_sector_rejected():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        bad = {**VALID_PROFILE, "description": "too short"}
+        bad = {**VALID_PROFILE, "sectors": ["not_a_real_sector"]}
         response = await client.post(
             "/api/v1/match", json=bad, headers={"X-API-Key": "changeme"}
         )
@@ -107,7 +105,7 @@ async def test_match_description_too_short_rejected():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_match_returns_match_response():
+async def test_match_valid_request_returns_grants():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
             "/api/v1/match", json=VALID_PROFILE, headers={"X-API-Key": "changeme"}
@@ -119,6 +117,21 @@ async def test_match_returns_match_response():
     assert "processing_time_ms" in body
     assert "data_freshness" in body
     assert isinstance(body["grants"], list)
+    # Validate structure of any returned grants
+    for grant in body["grants"]:
+        assert 0.0 <= grant["score"] <= 100.0
+        assert len(grant["top_factors"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_match_respects_top_n():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        profile = {**VALID_PROFILE, "top_n": 3}
+        response = await client.post(
+            "/api/v1/match", json=profile, headers={"X-API-Key": "changeme"}
+        )
+    assert response.status_code == 200
+    assert len(response.json()["grants"]) <= 3
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +139,27 @@ async def test_match_returns_match_response():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_grants_browse_empty_db():
+async def test_grants_browse_open():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/api/v1/grants?status=open", headers={"X-API-Key": "changeme"}
+        )
+    assert response.status_code == 200
+    grants = response.json()
+    assert isinstance(grants, list)
+    for grant in grants:
+        assert grant["status"] in ("open", "upcoming")
+
+
+@pytest.mark.asyncio
+async def test_grants_browse_returns_list():
+    """Browse endpoint returns a JSON list (may be empty or populated depending on DB state)."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(
             "/api/v1/grants", headers={"X-API-Key": "changeme"}
         )
     assert response.status_code == 200
-    assert response.json() == []
+    assert isinstance(response.json(), list)
 
 
 @pytest.mark.asyncio

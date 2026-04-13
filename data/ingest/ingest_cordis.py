@@ -34,7 +34,10 @@ from data.ingest import extract_sectors_from_text
 logger = logging.getLogger(__name__)
 
 CORDIS_CSV_URL = "https://cordis.europa.eu/data/cordis-HorizonEurope-projects.csv"
-DEFAULT_CSV_PATH = Path("data/raw/cordis-HorizonEurope-projects.csv")
+# The manually-downloaded CORDIS extract is named project.csv; fall back to
+# the original bulk-download filename if the user placed it there instead.
+DEFAULT_CSV_PATH = Path("data/raw/project.csv")
+_ALT_CSV_PATH = Path("data/raw/cordis-HorizonEurope-projects.csv")
 EUR_TO_GBP = 0.855  # approximate; update as needed
 CHUNK_SIZE = 500     # rows between commits
 REQUEST_TIMEOUT = 120.0
@@ -69,6 +72,9 @@ def _safe_str(value) -> str:
 
 def _safe_float(value) -> float | None:
     try:
+        if isinstance(value, str):
+            # CORDIS uses comma as decimal separator in some rows (e.g. "4969471,25")
+            value = value.replace(",", ".")
         f = float(value)
         return None if math.isnan(f) else f
     except (TypeError, ValueError):
@@ -176,17 +182,28 @@ async def ingest_cordis_csv(
     Returns the total number of records processed.
     """
     if not csv_path.exists():
-        if download_if_missing:
+        # Try the alternate filename before attempting a download
+        if csv_path == DEFAULT_CSV_PATH and _ALT_CSV_PATH.exists():
+            logger.info("Using alternate CORDIS CSV path: %s", _ALT_CSV_PATH)
+            csv_path = _ALT_CSV_PATH
+        elif download_if_missing:
             await _download_csv(csv_path)
         else:
             raise FileNotFoundError(f"CORDIS CSV not found: {csv_path}")
 
     logger.info("Reading CORDIS CSV: %s", csv_path)
-    # CORDIS CSVs use semicolon separators and may have a BOM
+    # CORDIS CSVs use semicolon separators and may have a BOM.
+    # Some objective fields contain semicolons inside quoted strings that
+    # confuse the C parser — use the Python engine and skip bad lines.
+    # The Python engine handles embedded semicolons in quoted fields correctly.
+    # low_memory is not supported by the Python engine — omit it.
+    _read_kwargs = dict(encoding="utf-8-sig", engine="python", on_bad_lines="skip")
     try:
-        df = pd.read_csv(csv_path, sep=";", encoding="utf-8-sig", low_memory=False)
+        df = pd.read_csv(csv_path, sep=";", **_read_kwargs)
+        if len(df.columns) < 5:
+            raise ValueError("too few columns — try comma separator")
     except Exception:
-        df = pd.read_csv(csv_path, sep=",", encoding="utf-8-sig", low_memory=False)
+        df = pd.read_csv(csv_path, sep=",", **_read_kwargs)
 
     logger.info("CORDIS CSV loaded: %d rows, columns: %s", len(df), list(df.columns[:10]))
 
