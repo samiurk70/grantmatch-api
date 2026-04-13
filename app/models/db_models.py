@@ -36,8 +36,8 @@ class Grant(Base):
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="open")
 
     # Eligibility criteria stored as JSON arrays.
-    # Typed as Optional[Any] — SQLAlchemy 2.0 cannot introspect Optional[list[str]]
-    # on Python 3.14 (Union.__getitem__ changed); runtime types enforced by Pydantic.
+    # Typed as Optional[Any] — SQLAlchemy 2.0 JSON columns are untyped at the ORM
+    # level; runtime types are enforced by Pydantic on the API boundary.
     eligibility_org_types: Mapped[Optional[Any]] = mapped_column(JSON)
     # e.g. ["sme", "university", "charity", "large_company", "individual"]
 
