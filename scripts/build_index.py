@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import AsyncSessionLocal, create_all_tables
 from app.models.db_models import Grant
-from app.services.embedder import embed
+from app.services.embedder import get_embedder
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ async def build_index(db_session: AsyncSession) -> int:
     for batch_start in range(0, len(grants), BATCH_SIZE):
         batch = grants[batch_start : batch_start + BATCH_SIZE]
         texts = [_text_for_grant(g) for g in batch]
-        vectors = embed(texts)  # shape (batch, dim), already L2-normalised
+        vectors = get_embedder().encode(texts)  # shape (batch, dim), L2-normalised
 
         for grant, vec in zip(batch, vectors):
             grant.embedding_vector = _pack_vector(vec)

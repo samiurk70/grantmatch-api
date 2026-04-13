@@ -4,18 +4,20 @@ Ingest UK government grants from GOV.UK Find a Grant.
 Standalone usage:
     python -m data.ingest.ingest_govuk_grants
 
-The service has no public API — we scrape the HTML listing page and
-follow pagination via ?skip=N&limit=10 query parameters.
+The service is a Next.js application — grant data is embedded as JSON in
+the __NEXT_DATA__ script tag on each listing page. No HTML card parsing is
+needed. Pagination uses ?page=N query parameter, 10 results per page.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime
+from math import ceil
 
 import httpx
-from bs4 import BeautifulSoup
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,44 +33,71 @@ PAGE_SIZE = 10
 REQUEST_TIMEOUT = 30.0
 RETRY_ATTEMPTS = 3
 
-# Mapping of description keywords → eligibility org types
-_ORG_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bsme\b|small.and.medium|small business", re.I), "sme"),
-    (re.compile(r"\bstartup\b|\bstart.up\b", re.I), "startup"),
-    (re.compile(r"\buniversit|\bacademi|\bresearch.institution", re.I), "university"),
-    (re.compile(r"\bcharity\b|\bcharities\b|\bvoluntary\b|\bvcse\b|\bngo\b", re.I), "charity"),
-    (re.compile(r"\blarge.compan|\bcorporat|\bmultinational", re.I), "large_company"),
-    (re.compile(r"\bindividual\b|\bsole.trader\b|\bfreelance", re.I), "individual"),
-]
+# ---------------------------------------------------------------------------
+# Field mappings
+# ---------------------------------------------------------------------------
+
+# grantApplicantType values → our org type codes
+_APPLICANT_TYPE_MAP: dict[str, list[str]] = {
+    "Personal / Individual": ["individual"],
+    "Non-profit":            ["charity"],
+    "Private Sector":        ["sme", "startup", "large_company"],
+    "Public Sector":         [],   # no equivalent in our schema
+    "Local authority":       [],
+}
+
+# grantLocation values → our region codes
+_LOCATION_MAP: dict[str, str] = {
+    "England":            "england",
+    "North East England": "england",
+    "North West England": "england",
+    "South East England": "england",
+    "South West England": "england",
+    "Midlands":           "england",
+    "Scotland":           "scotland",
+    "Wales":              "wales",
+    "Northern Ireland":   "northern_ireland",
+    "National":           "uk",
+}
 
 
-def _slugify(text: str) -> str:
-    """Convert a grant title to a stable slug for use as external_id."""
-    text = text.lower().strip()
-    text = re.sub(r"[^\w\s-]", "", text)
-    text = re.sub(r"[\s_-]+", "-", text)
-    return text[:190]
+def _map_org_types(applicant_types: list[str]) -> list[str]:
+    result: list[str] = []
+    for t in applicant_types:
+        result.extend(_APPLICANT_TYPE_MAP.get(t, []))
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for x in result:
+        if x not in seen:
+            seen.add(x)
+            deduped.append(x)
+    return deduped or ["sme", "university", "charity", "large_company"]
 
 
-def _parse_deadline(text: str | None) -> datetime | None:
-    if not text:
+def _map_regions(locations: list[str]) -> list[str]:
+    regions: set[str] = set()
+    for loc in locations:
+        code = _LOCATION_MAP.get(loc)
+        if code:
+            regions.add(code)
+    if not regions:
+        return ["uk"]
+    # If all four sub-regions of UK appear, collapse to "uk"
+    uk_sub = {"england", "scotland", "wales", "northern_ireland"}
+    if uk_sub.issubset(regions):
+        return ["uk"]
+    return sorted(regions)
+
+
+def _parse_iso_date(value: str | None) -> datetime | None:
+    if not value:
         return None
-    text = text.strip()
-    for fmt in ("%d %B %Y", "%d/%m/%Y", "%Y-%m-%d", "%B %d, %Y"):
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
         try:
-            return datetime.strptime(text, fmt)
+            return datetime.strptime(value[:19], fmt)
         except ValueError:
             continue
     return None
-
-
-def _extract_org_types(text: str) -> list[str]:
-    found: list[str] = []
-    for pattern, org_type in _ORG_TYPE_PATTERNS:
-        if pattern.search(text):
-            found.append(org_type)
-    # Default: if nothing specific found, open to most types
-    return found or ["sme", "large_company", "university", "charity"]
 
 
 def _derive_status(deadline: datetime | None) -> str:
@@ -77,82 +106,89 @@ def _derive_status(deadline: datetime | None) -> str:
     return "open" if deadline > datetime.utcnow() else "closed"
 
 
-def _parse_grant_card(card: BeautifulSoup, base_url: str) -> dict | None:
-    """Extract fields from a single grant listing card element."""
-    try:
-        title_el = card.select_one("h2 a, h3 a, .grant-title a, a.govuk-link")
-        if not title_el:
-            return None
-        title = title_el.get_text(strip=True)
-        href = title_el.get("href", "")
-        url = href if href.startswith("http") else f"{base_url}{href}"
-        external_id = _slugify(title)
-
-        description = ""
-        desc_el = card.select_one("p.govuk-body, .grant-summary, p")
-        if desc_el:
-            description = desc_el.get_text(strip=True)
-
-        funder = ""
-        funder_el = card.select_one(".grant-funder, [data-funder]")
-        if funder_el:
-            funder = funder_el.get_text(strip=True)
-
-        deadline_text = ""
-        deadline_el = card.select_one(".grant-deadline, [data-deadline], time")
-        if deadline_el:
-            deadline_text = deadline_el.get("datetime") or deadline_el.get_text(strip=True)
-
-        deadline = _parse_deadline(deadline_text)
-        status = _derive_status(deadline)
-
-        full_text = f"{title} {description}"
-        return dict(
-            source="govuk",
-            external_id=external_id,
-            title=title[:500],
-            description=description or None,
-            summary=description[:200] if description else None,
-            funder=funder or "UK Government",
-            programme=None,
-            funding_min=None,
-            funding_max=None,
-            deadline=deadline,
-            open_date=None,
-            status=status,
-            eligibility_org_types=_extract_org_types(full_text),
-            eligibility_sectors=extract_sectors_from_text(full_text),
-            eligibility_regions=["uk"],
-            eligibility_trl=None,
-            url=url,
-        )
-    except Exception as exc:
-        logger.warning("Failed to parse grant card: %s", exc)
+def _build_grant(item: dict) -> dict | None:
+    """Map one __NEXT_DATA__ grant item to Grant column kwargs."""
+    name = (item.get("grantName") or "").strip()
+    label = (item.get("label") or "").strip()
+    if not name or not label:
         return None
 
+    description = (item.get("grantShortDescription") or "").strip()
+    funder = (item.get("grantFunder") or "UK Government").strip()
 
-async def _fetch_page(
-    client: httpx.AsyncClient, skip: int
-) -> BeautifulSoup | None:
-    params = {"skip": skip, "limit": PAGE_SIZE}
+    funding_min = item.get("grantMinimumAward")
+    funding_max = item.get("grantMaximumAward")
+    try:
+        funding_min = float(funding_min) if funding_min is not None else None
+        funding_max = float(funding_max) if funding_max is not None else None
+    except (TypeError, ValueError):
+        funding_min = funding_max = None
+
+    open_date = _parse_iso_date(item.get("grantApplicationOpenDate"))
+    deadline = _parse_iso_date(item.get("grantApplicationCloseDate"))
+    status = _derive_status(deadline)
+
+    org_types = _map_org_types(item.get("grantApplicantType") or [])
+    regions = _map_regions(item.get("grantLocation") or [])
+
+    full_text = f"{name} {description}"
+    url = f"{BASE_URL}{GRANTS_PATH}/{label}"
+
+    return dict(
+        source="govuk",
+        external_id=label,
+        title=name[:500],
+        description=description or None,
+        summary=description[:200] if description else None,
+        funder=funder,
+        programme=None,
+        funding_min=funding_min,
+        funding_max=funding_max,
+        open_date=open_date,
+        deadline=deadline,
+        status=status,
+        eligibility_org_types=org_types,
+        eligibility_sectors=extract_sectors_from_text(full_text),
+        eligibility_regions=regions,
+        eligibility_trl=None,
+        url=url,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+async def _fetch_page(client: httpx.AsyncClient, page: int) -> dict | None:
+    """Fetch one listing page and return the parsed __NEXT_DATA__ props."""
+    params = {"page": page} if page > 1 else {}
     last_exc: Exception | None = None
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            response = await client.get(
-                f"{BASE_URL}{GRANTS_PATH}", params=params
-            )
+            response = await client.get(f"{BASE_URL}{GRANTS_PATH}", params=params)
             response.raise_for_status()
-            return BeautifulSoup(response.text, "lxml")
-        except httpx.HTTPError as exc:
-            last_exc = exc
-            logger.warning(
-                "GOV.UK page skip=%d attempt %d/%d failed: %s",
-                skip, attempt, RETRY_ATTEMPTS, exc,
+            # Extract __NEXT_DATA__ JSON embedded in the page
+            match = re.search(
+                r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+                response.text,
+                re.DOTALL,
             )
+            if not match:
+                logger.warning("No __NEXT_DATA__ found on page %d", page)
+                return None
+            data = json.loads(match.group(1))
+            return data.get("props", {}).get("pageProps", {})
+        except (httpx.HTTPError, json.JSONDecodeError, KeyError) as exc:
+            last_exc = exc
+            logger.warning("GOV.UK page %d attempt %d/%d failed: %s", page, attempt, RETRY_ATTEMPTS, exc)
             await asyncio.sleep(2 ** attempt)
-    logger.error("Giving up on GOV.UK skip=%d: %s", skip, last_exc)
+    logger.error("Giving up on GOV.UK page %d: %s", page, last_exc)
     return None
 
+
+# ---------------------------------------------------------------------------
+# Upsert
+# ---------------------------------------------------------------------------
 
 async def _upsert(session: AsyncSession, data: dict) -> None:
     result = await session.execute(
@@ -167,51 +203,56 @@ async def _upsert(session: AsyncSession, data: dict) -> None:
         session.add(Grant(**data))
 
 
+# ---------------------------------------------------------------------------
+# Main ingest function
+# ---------------------------------------------------------------------------
+
 async def ingest_govuk_grants(db_session: AsyncSession) -> int:
     """
-    Scrape GOV.UK Find a Grant and upsert Grant rows.
+    Scrape GOV.UK Find a Grant via embedded __NEXT_DATA__ JSON and upsert
+    Grant rows.
 
     Returns the total number of records processed.
     """
     total = 0
+    total_grants = None
+    page = 1
 
     async with httpx.AsyncClient(
         timeout=REQUEST_TIMEOUT,
         follow_redirects=True,
         headers={"User-Agent": "GrantMatch-Ingest/1.0 (research tool)"},
     ) as client:
-        skip = 0
         while True:
-            soup = await _fetch_page(client, skip)
-            if soup is None:
+            props = await _fetch_page(client, page)
+            if props is None:
                 break
 
-            # The service uses several possible card selectors across versions
-            cards = (
-                soup.select("li.grants-list__item")
-                or soup.select("div.grant-card")
-                or soup.select("article")
-            )
+            if total_grants is None:
+                total_grants = props.get("totalGrants", 0)
+                total_pages = ceil(total_grants / PAGE_SIZE)
+                logger.info("GOV.UK: %d grants across %d pages.", total_grants, total_pages)
 
-            if not cards:
-                logger.info("GOV.UK: no grant cards found at skip=%d, stopping.", skip)
+            items = props.get("searchResult", [])
+            if not items:
+                logger.info("GOV.UK: no items on page %d, stopping.", page)
                 break
 
-            for card in cards:
-                data = _parse_grant_card(card, BASE_URL)
+            for item in items:
+                data = _build_grant(item)
                 if data:
                     await _upsert(db_session, data)
                     total += 1
 
             await db_session.commit()
-            logger.info("GOV.UK: upserted %d records so far (skip=%d).", total, skip)
+            logger.info("GOV.UK: page %d done — %d records upserted so far.", page, total)
 
-            # Check for a "next page" link; stop if absent
-            next_link = soup.select_one("a[rel='next'], .govuk-pagination__next a")
-            if not next_link and len(cards) < PAGE_SIZE:
+            # Stop when we've fetched all pages
+            if total_grants and total >= total_grants:
                 break
-
-            skip += PAGE_SIZE
+            if len(items) < PAGE_SIZE:
+                break
+            page += 1
 
     logger.info("GOV.UK ingestion complete: %d records total.", total)
     return total

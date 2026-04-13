@@ -1,74 +1,120 @@
-"""Builds a numeric feature vector for each (grant, profile) pair fed to the reranker."""
+"""Extracts a named feature dict for each (grant, profile) pair."""
 from __future__ import annotations
 
-import numpy as np
+from datetime import datetime
 
 from app.models.db_models import Grant
-from app.models.schemas import ApplicantProfile, FactorExplanation
+from app.models.schemas import ApplicantProfile
+
+# Canonical feature order — must match ml/train.py when building training matrix
+FEATURE_NAMES: list[str] = [
+    "semantic_similarity",
+    "sector_overlap",
+    "org_type_match",
+    "trl_match",
+    "region_match",
+    "is_open",
+    "days_to_deadline",
+    "funding_fit",
+    "description_length",
+]
+
+_UK_LOCATIONS = frozenset(["uk", "england", "scotland", "wales", "northern_ireland"])
 
 
-def build_feature_vector(
+def _sector_jaccard(profile_sectors: list[str], grant_sectors: list | None) -> float:
+    if not grant_sectors or not profile_sectors:
+        return 0.0
+    a, b = set(profile_sectors), set(grant_sectors)
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
+def _org_type_score(profile_org: str, grant_org_types: list | None) -> float:
+    if not grant_org_types:
+        return 0.5   # no restriction known → uncertain
+    return 1.0 if profile_org in grant_org_types else 0.0
+
+
+def _trl_score(profile_trl: int | None, grant_trl: list | None) -> float:
+    if profile_trl is None or not grant_trl:
+        return 0.5   # unknown → uncertain
+    trl_min, trl_max = grant_trl[0], grant_trl[-1]
+    return 1.0 if trl_min <= profile_trl <= trl_max else 0.0
+
+
+def _region_score(profile_location: str, grant_regions: list | None) -> float:
+    if not grant_regions:
+        return 0.5
+    regions = set(grant_regions)
+    if "international" in regions or profile_location in regions:
+        return 1.0
+    if "uk" in regions and profile_location in _UK_LOCATIONS:
+        return 1.0
+    if profile_location == "uk" and regions & _UK_LOCATIONS:
+        return 1.0
+    return 0.0
+
+
+def _days_to_deadline_score(deadline: datetime | None) -> float:
+    if deadline is None:
+        return 0.5
+    delta = (deadline - datetime.utcnow()).days
+    if delta <= 0:
+        return 0.0
+    return min(delta / 180.0, 1.0)
+
+
+def _funding_fit_score(
+    funding_needed: float | None,
+    funding_min: float | None,
+    funding_max: float | None,
+) -> float:
+    if funding_needed is None or (funding_min is None and funding_max is None):
+        return 0.5
+    if funding_max is not None and funding_needed > funding_max:
+        return 0.0
+    if funding_min is not None and funding_needed < funding_min:
+        return 0.2   # asking for less than the minimum — unlikely to qualify
+    return 1.0
+
+
+def _description_length_score(description: str | None) -> float:
+    if not description:
+        return 0.0
+    word_count = len(description.split())
+    return min(word_count / 500.0, 1.0)
+
+
+def extract_features(
     grant: Grant,
     profile: ApplicantProfile,
-    cosine_sim: float,
-    factors: list[FactorExplanation],
-) -> np.ndarray:
+    semantic_score: float,
+) -> dict[str, float]:
     """
-    Return a 1-D float32 feature vector for XGBoost reranker input.
+    Build a named feature dict for one (grant, profile) pair.
 
-    Features (9 total):
-      0  cosine_sim          — semantic similarity score from FAISS
-      1  positive_signals    — count of positive eligibility factors
-      2  negative_signals    — count of negative eligibility factors
-      3  funding_max_log     — log1p(funding_max in GBP) or 0
-      4  funding_min_log     — log1p(funding_min in GBP) or 0
-      5  trl_distance        — abs diff between profile TRL and grant TRL midpoint (0 if unknown)
-      6  sector_overlap      — fraction of profile sectors matching grant sectors
-      7  org_type_match      — 1.0 if org type is in eligibility_org_types else 0.0
-      8  region_match        — 1.0 if location is in eligibility_regions else 0.0
+    semantic_score: cosine similarity from FAISS (0–1, already normalised).
+    All returned values are floats in [0, 1].
     """
-    positives = sum(1 for f in factors if f.direction == "positive")
-    negatives = sum(1 for f in factors if f.direction == "negative")
+    return {
+        "semantic_similarity": float(max(0.0, min(1.0, semantic_score))),
+        "sector_overlap":      _sector_jaccard(profile.sectors, grant.eligibility_sectors),
+        "org_type_match":      _org_type_score(profile.organisation_type, grant.eligibility_org_types),
+        "trl_match":           _trl_score(profile.trl, grant.eligibility_trl),
+        "region_match":        _region_score(profile.location, grant.eligibility_regions),
+        "is_open":             1.0 if grant.status in ("open", "upcoming") else 0.0,
+        "days_to_deadline":    _days_to_deadline_score(grant.deadline),
+        "funding_fit":         _funding_fit_score(
+                                   profile.funding_needed,
+                                   grant.funding_min,
+                                   grant.funding_max,
+                               ),
+        "description_length":  _description_length_score(grant.description),
+    }
 
-    funding_max_log = float(np.log1p(grant.funding_max or 0))
-    funding_min_log = float(np.log1p(grant.funding_min or 0))
 
-    if grant.eligibility_trl and profile.trl is not None:
-        trl_mid = sum(grant.eligibility_trl) / len(grant.eligibility_trl)
-        trl_distance = abs(profile.trl - trl_mid) / 9.0
-    else:
-        trl_distance = 0.0
-
-    if grant.eligibility_sectors and profile.sectors:
-        overlap = len(set(profile.sectors) & set(grant.eligibility_sectors))
-        sector_overlap = overlap / max(len(profile.sectors), 1)
-    else:
-        sector_overlap = 0.0
-
-    org_type_match = float(
-        bool(grant.eligibility_org_types)
-        and profile.organisation_type in grant.eligibility_org_types
-    )
-
-    region_match = float(
-        bool(grant.eligibility_regions)
-        and (
-            profile.location in grant.eligibility_regions
-            or "international" in grant.eligibility_regions
-        )
-    )
-
-    return np.array(
-        [
-            cosine_sim,
-            positives,
-            negatives,
-            funding_max_log,
-            funding_min_log,
-            trl_distance,
-            sector_overlap,
-            org_type_match,
-            region_match,
-        ],
-        dtype=np.float32,
-    )
+def features_to_array(features: dict[str, float]):
+    """Convert a feature dict to a float32 numpy array in FEATURE_NAMES order."""
+    import numpy as np
+    return np.array([features[k] for k in FEATURE_NAMES], dtype=np.float32)

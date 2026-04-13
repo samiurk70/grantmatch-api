@@ -129,3 +129,21 @@ class HealthResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     detail: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Grant browse schema (lightweight — no score or factors)
+# ---------------------------------------------------------------------------
+
+class GrantSummary(BaseModel):
+    grant_id: int
+    title: str
+    funder: str
+    programme: Optional[str] = None
+    summary: Optional[str] = None
+    status: str
+    funding_range: str
+    deadline: Optional[datetime] = None
+    url: Optional[str] = None
+    eligibility_regions: Optional[list[str]] = None
+    eligibility_sectors: Optional[list[str]] = None
