@@ -1,0 +1,11 @@
+data/raw/
+data/grants.db
+data/grants.faiss
+ml/model.pkl
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.env
+*.pyc
+*.pyo
+.git/

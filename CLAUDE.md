@@ -58,6 +58,12 @@ existing tools are keyword search only.
    URL: https://www.ukri.org/opportunity/
    Format: HTML scrape
 
+## Target runtime
+- Python: 3.11.x (pinned in .python-version as 3.11.9)
+- Docker base image: python:3.11-slim
+- All pinned versions in requirements.txt are tested on Python 3.11
+- Dev machine may run 3.14 — that is fine, but deploy target is 3.11
+
 ## Do not
 - Do not use any paid data sources or require API keys for data ingestion
 - Do not load embedding model on every request — cache at startup

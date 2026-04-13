@@ -26,8 +26,8 @@ Phase 5 complete + post-Phase-5 bug fixes applied + full ingestion + FAISS index
 - Macro F1: 0.98
 
 ## Environment
-- Python 3.14.3 on Windows
-- greenlet==3.4.0 manually added to requirements.txt (SQLAlchemy async dep)
+- Target Python: 3.11.x (pinned in .python-version as 3.11.9 for pyenv/Railway)
+- Dev environment: Python 3.14.3 on Windows (used during initial development)
 - HF_HUB_DISABLE_SYMLINKS_WARNING should be set on Windows
 - sentence-transformers model: all-MiniLM-L6-v2 (cached after first run)
 - Docker not used for dev — run with: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -48,8 +48,8 @@ docker-compose.yml created but Docker not used for local dev.
   MatchResponse, HealthResponse, ErrorResponse
 - app/database.py: async SQLAlchemy engine, get_db() dependency,
   create_all_tables(), connect_args check_same_thread for SQLite
-- JSON columns typed as Mapped[Optional[Any]] due to Python 3.14
-  SQLAlchemy Union.__getitem__ bug
+- JSON columns typed as Mapped[Optional[Any]] — SQLAlchemy 2.0 JSON columns
+  are untyped at the ORM level; runtime types enforced by Pydantic
 - routes.py takes ApplicantProfile directly, no MatchRequest wrapper
 
 ### Phase 3 — Data ingestion scripts
@@ -202,6 +202,10 @@ Result: 19,476 rows loaded, 0 skipped from the manually extracted CSV.
 - GOV.UK scraper reads __NEXT_DATA__ JSON (not HTML) — recheck if Next.js
   build ID changes and data structure shifts
 - UKRI scraper uses div.opportunity selector — recheck if WordPress theme changes
+- Docker uses CPU-only PyTorch (190MB wheel, not 3GB CUDA) via pytorch.org/whl/cpu index
+- requirements.txt = production deps only; test deps in requirements-dev.txt
+- data/grants.db, data/grants.faiss, ml/model.pkl all gitignored and dockerignored
+  — must be regenerated post-deploy (app works in degraded mode without them)
 
 ## File Structure (complete)
 grantmatch-api/
@@ -215,7 +219,9 @@ grantmatch-api/
 ├── ml/train.py, evaluate.py
 ├── tests/test_api.py, test_matcher.py
 ├── data/raw/project.csv  (CORDIS — manually downloaded, gitignored)
-└── CLAUDE.md, PROGRESS.md, README.md, requirements.txt, .env
+├── requirements.txt (production deps), requirements-dev.txt (+ pytest/pytest-asyncio)
+├── Dockerfile, .dockerignore, railway.json, Procfile, .railwayignore
+└── CLAUDE.md, PROGRESS.md, README.md, .env, .env.example
 
 ---
 
@@ -269,4 +275,95 @@ GREEN.DAT.AI project) with semantic_similarity=0.5953, score=84.22.
 Processing time: 412ms (vs 2856ms using DB fallback before index was built).
 All response fields present: grant_id, title, score, confidence, top_factors (3 each),
 eligibility_verdict, funding_range, url, processing_time_ms, data_freshness.
+
+---
+
+## Session 4 — Railway Deployment Prep (2026-04-13)
+
+### Files created
+- **`railway.json`**: Tells Railway to use the Dockerfile builder, sets start command to
+  `uvicorn app.main:app --host 0.0.0.0 --port $PORT`, healthcheck at `/health`.
+- **`Procfile`**: Railway fallback (if Dockerfile builder not detected):
+  `web: uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
+- **`.railwayignore`**: Excludes `data/raw/`, `data/grants.db`, `data/grants.faiss`,
+  `ml/model.pkl`, `__pycache__/`, `.pytest_cache/` from Railway git push.
+- **`.dockerignore`**: Excludes the same large/local-only files from the Docker build
+  context (also excludes `.env`, `*.pyc`, `*.pyo`, `.git/`). Keeps context small and
+  prevents local DB/index from leaking into the image.
+- **`requirements-dev.txt`**: New file — `-r requirements.txt` plus `pytest==8.3.3` and
+  `pytest-asyncio==0.24.0`. Use this for local dev and CI; the production Docker image
+  only uses `requirements.txt`.
+
+### Files modified
+- **`Dockerfile`**: Added `RUN pip install --no-cache-dir torch --index-url
+  https://download.pytorch.org/whl/cpu` as a separate layer *before* `pip install -r
+  requirements.txt`. This pins CPU-only PyTorch (190MB wheel vs 3GB CUDA build) so the
+  Docker image stays deployable without a GPU.
+- **`requirements.txt`**: Removed `pytest==8.3.3` and `pytest-asyncio==0.24.0` — test
+  deps don't belong in the production image. Moved to `requirements-dev.txt`.
+- **`.env.example`**: Added comment block above `DATABASE_URL` explaining that Railway's
+  Postgres plugin sets this automatically in production as a `postgresql+asyncpg://...` URL.
+
+### Docker build outcome
+`docker build .` completed successfully (exit code 0) after two attempts:
+- **Attempt 1 failed**: `pytest-asyncio==0.24.0` hash mismatch — pip downloaded an empty
+  file (transient Docker network issue, SHA256 of empty string = `e3b0c44...`). Root fix:
+  removed test deps from requirements.txt entirely.
+- **Attempt 2 succeeded**: All packages installed cleanly. Installed packages include
+  `nvidia-nccl-cu12` (pulled as a transitive dep of sentence-transformers). This is a
+  ~300MB overhead but doesn't affect correctness — torch is still the CPU build.
+
+### Post-deploy checklist (not yet done)
+1. Add Postgres plugin in Railway → `DATABASE_URL` set automatically.
+2. Set remaining env vars: `API_KEY`, `EMBEDDING_MODEL`, `MAX_RESULTS`, etc.
+3. After first deploy: run ingestion scripts and `python -m scripts.build_index`.
+4. `python ml/train.py` to generate `ml/model.pkl`.
+5. Without steps 3–4, the app starts in degraded mode: DB-fallback matching (no FAISS
+   semantic search) and heuristic scoring (no XGBoost reranker). All endpoints still work.
+
+---
+
+## Session 5 — Python 3.11 Compatibility Refactor (2026-04-13)
+
+### Goal
+Migrate pinned dependencies from versions targeting Python 3.14 to versions known
+to work cleanly on Python 3.11 (the target runtime for Docker and Railway).
+
+### requirements.txt — version changes
+| Package | Old (3.14 era) | New (3.11 stable) |
+|---------|---------------|-------------------|
+| sentence-transformers | 3.0.1 | 2.7.0 |
+| faiss-cpu | 1.12.0 | 1.8.0 |
+| xgboost | 2.1.4 | 2.1.1 |
+| shap | 0.50.0 | 0.45.1 |
+| scikit-learn | 1.7.2 | 1.5.2 |
+| sqlalchemy | 2.0.49 | 2.0.35 |
+| greenlet | 3.4.0 | 3.0.3 |
+| lxml | 6.0.1 | 5.3.0 |
+| pandas | 2.3.3 | 2.2.3 |
+| numpy | 2.3.5 | 1.26.4 |
+| pydantic | 2.12.0 | 2.9.2 |
+| pydantic-settings | 2.9.1 | 2.4.0 |
+| uvicorn | 0.30.6 | 0.30.6[standard] |
+
+Unchanged: fastapi, aiosqlite, beautifulsoup4, httpx, python-dotenv.
+
+### Python 3.14-specific workarounds removed
+- **app/models/db_models.py comment**: Replaced "due to Python 3.14 SQLAlchemy
+  Union.__getitem__ bug" with a neutral explanation. The `Mapped[Optional[Any]]`
+  typing is kept — it remains the correct approach for SQLAlchemy JSON columns
+  regardless of Python version.
+- **PROGRESS.md Phase 2 note**: Same update — removed 3.14 bug reference.
+- No `from __future__ import annotations` imports were removed — these are valid
+  and beneficial on 3.11 (PEP 563, avoids forward-reference issues).
+
+### New files
+- **`.python-version`**: Contains `3.11.9` — read by pyenv locally and by Railway
+  to select the correct Python runtime.
+
+### What stayed the same
+- All application logic unchanged.
+- Dockerfile already had `FROM python:3.11-slim` — no change needed.
+- `requirements-dev.txt` unchanged (pytest==8.3.3, pytest-asyncio==0.24.0 already correct).
+- 31/31 tests still passing after dep version changes (run on Python 3.14 dev env).
 
