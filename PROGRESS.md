@@ -202,6 +202,10 @@ Result: 19,476 rows loaded, 0 skipped from the manually extracted CSV.
 - GOV.UK scraper reads __NEXT_DATA__ JSON (not HTML) — recheck if Next.js
   build ID changes and data structure shifts
 - UKRI scraper uses div.opportunity selector — recheck if WordPress theme changes
+- Docker uses CPU-only PyTorch (190MB wheel, not 3GB CUDA) via pytorch.org/whl/cpu index
+- requirements.txt = production deps only; test deps in requirements-dev.txt
+- data/grants.db, data/grants.faiss, ml/model.pkl all gitignored and dockerignored
+  — must be regenerated post-deploy (app works in degraded mode without them)
 
 ## File Structure (complete)
 grantmatch-api/
@@ -215,7 +219,9 @@ grantmatch-api/
 ├── ml/train.py, evaluate.py
 ├── tests/test_api.py, test_matcher.py
 ├── data/raw/project.csv  (CORDIS — manually downloaded, gitignored)
-└── CLAUDE.md, PROGRESS.md, README.md, requirements.txt, .env
+├── requirements.txt (production deps), requirements-dev.txt (+ pytest/pytest-asyncio)
+├── Dockerfile, .dockerignore, railway.json, Procfile, .railwayignore
+└── CLAUDE.md, PROGRESS.md, README.md, .env, .env.example
 
 ---
 
@@ -269,4 +275,49 @@ GREEN.DAT.AI project) with semantic_similarity=0.5953, score=84.22.
 Processing time: 412ms (vs 2856ms using DB fallback before index was built).
 All response fields present: grant_id, title, score, confidence, top_factors (3 each),
 eligibility_verdict, funding_range, url, processing_time_ms, data_freshness.
+
+---
+
+## Session 4 — Railway Deployment Prep (2026-04-13)
+
+### Files created
+- **`railway.json`**: Tells Railway to use the Dockerfile builder, sets start command to
+  `uvicorn app.main:app --host 0.0.0.0 --port $PORT`, healthcheck at `/health`.
+- **`Procfile`**: Railway fallback (if Dockerfile builder not detected):
+  `web: uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
+- **`.railwayignore`**: Excludes `data/raw/`, `data/grants.db`, `data/grants.faiss`,
+  `ml/model.pkl`, `__pycache__/`, `.pytest_cache/` from Railway git push.
+- **`.dockerignore`**: Excludes the same large/local-only files from the Docker build
+  context (also excludes `.env`, `*.pyc`, `*.pyo`, `.git/`). Keeps context small and
+  prevents local DB/index from leaking into the image.
+- **`requirements-dev.txt`**: New file — `-r requirements.txt` plus `pytest==8.3.3` and
+  `pytest-asyncio==0.24.0`. Use this for local dev and CI; the production Docker image
+  only uses `requirements.txt`.
+
+### Files modified
+- **`Dockerfile`**: Added `RUN pip install --no-cache-dir torch --index-url
+  https://download.pytorch.org/whl/cpu` as a separate layer *before* `pip install -r
+  requirements.txt`. This pins CPU-only PyTorch (190MB wheel vs 3GB CUDA build) so the
+  Docker image stays deployable without a GPU.
+- **`requirements.txt`**: Removed `pytest==8.3.3` and `pytest-asyncio==0.24.0` — test
+  deps don't belong in the production image. Moved to `requirements-dev.txt`.
+- **`.env.example`**: Added comment block above `DATABASE_URL` explaining that Railway's
+  Postgres plugin sets this automatically in production as a `postgresql+asyncpg://...` URL.
+
+### Docker build outcome
+`docker build .` completed successfully (exit code 0) after two attempts:
+- **Attempt 1 failed**: `pytest-asyncio==0.24.0` hash mismatch — pip downloaded an empty
+  file (transient Docker network issue, SHA256 of empty string = `e3b0c44...`). Root fix:
+  removed test deps from requirements.txt entirely.
+- **Attempt 2 succeeded**: All packages installed cleanly. Installed packages include
+  `nvidia-nccl-cu12` (pulled as a transitive dep of sentence-transformers). This is a
+  ~300MB overhead but doesn't affect correctness — torch is still the CPU build.
+
+### Post-deploy checklist (not yet done)
+1. Add Postgres plugin in Railway → `DATABASE_URL` set automatically.
+2. Set remaining env vars: `API_KEY`, `EMBEDDING_MODEL`, `MAX_RESULTS`, etc.
+3. After first deploy: run ingestion scripts and `python -m scripts.build_index`.
+4. `python ml/train.py` to generate `ml/model.pkl`.
+5. Without steps 3–4, the app starts in degraded mode: DB-fallback matching (no FAISS
+   semantic search) and heuristic scoring (no XGBoost reranker). All endpoints still work.
 
