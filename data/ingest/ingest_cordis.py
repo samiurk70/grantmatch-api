@@ -22,6 +22,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import io
+import zipfile
+
 import httpx
 import pandas as pd
 from sqlalchemy import select
@@ -33,9 +36,9 @@ from data.ingest import extract_sectors_from_text
 
 logger = logging.getLogger(__name__)
 
-CORDIS_CSV_URL = "https://cordis.europa.eu/data/cordis-HorizonEurope-projects.csv"
-# The manually-downloaded CORDIS extract is named project.csv; fall back to
-# the original bulk-download filename if the user placed it there instead.
+CORDIS_ZIP_URL = "https://cordis.europa.eu/data/cordis-HORIZONprojects-csv.zip"
+# project.csv is the 46 MB file inside the zip that contains grant data.
+# The zip also contains organization.csv, topics.csv, legalBasis.csv — ignore those.
 DEFAULT_CSV_PATH = Path("data/raw/project.csv")
 _ALT_CSV_PATH = Path("data/raw/cordis-HorizonEurope-projects.csv")
 EUR_TO_GBP = 0.855  # approximate; update as needed
@@ -48,16 +51,30 @@ REQUEST_TIMEOUT = 120.0
 # ---------------------------------------------------------------------------
 
 async def _download_csv(dest: Path) -> None:
-    """Stream the CORDIS CSV to *dest*, creating parent dirs as needed."""
+    """Download the CORDIS zip, extract project.csv, and save it to *dest*."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading CORDIS CSV → %s", dest)
+    logger.info("Downloading CORDIS zip from %s", CORDIS_ZIP_URL)
+
+    buf = io.BytesIO()
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
-        async with client.stream("GET", CORDIS_CSV_URL) as response:
+        async with client.stream("GET", CORDIS_ZIP_URL) as response:
             response.raise_for_status()
-            with dest.open("wb") as fh:
-                async for chunk in response.aiter_bytes(chunk_size=65_536):
-                    fh.write(chunk)
-    logger.info("Download complete: %s (%.1f MB)", dest, dest.stat().st_size / 1_048_576)
+            async for chunk in response.aiter_bytes(chunk_size=65_536):
+                buf.write(chunk)
+
+    buf.seek(0)
+    with zipfile.ZipFile(buf) as zf:
+        names = zf.namelist()
+        logger.info("Zip contents: %s", names)
+        csv_name = next((n for n in names if n.endswith("project.csv")), None)
+        if csv_name is None:
+            raise FileNotFoundError(
+                f"project.csv not found in zip. Zip contains: {names}"
+            )
+        with zf.open(csv_name) as src, dest.open("wb") as dst:
+            dst.write(src.read())
+
+    logger.info("Extracted project.csv → %s (%.1f MB)", dest, dest.stat().st_size / 1_048_576)
 
 
 # ---------------------------------------------------------------------------

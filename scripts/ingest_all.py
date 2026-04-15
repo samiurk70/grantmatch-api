@@ -77,10 +77,17 @@ async def _run_ingestion() -> None:
             )
         else:
             logger.info(
-                "No CORDIS records found — downloading CSV from cordis.europa.eu (~250 MB)."
+                "No CORDIS records found — downloading zip from cordis.europa.eu."
             )
-            n = await ingest_cordis_csv(session)
-            logger.info("CORDIS done: %d records", n)
+            try:
+                n = await ingest_cordis_csv(session)
+                logger.info("CORDIS done: %d records", n)
+            except Exception as exc:
+                logger.error(
+                    "CORDIS ingestion failed (%s) — continuing without it. "
+                    "Re-run python -m scripts.ingest_all to retry.",
+                    exc,
+                )
 
 
 async def _run_build_index() -> None:
