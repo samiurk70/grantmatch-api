@@ -367,3 +367,108 @@ Unchanged: fastapi, aiosqlite, beautifulsoup4, httpx, python-dotenv.
 - `requirements-dev.txt` unchanged (pytest==8.3.3, pytest-asyncio==0.24.0 already correct).
 - 31/31 tests still passing after dep version changes (run on Python 3.14 dev env).
 
+---
+
+## Session 6 — Railway Production Deployment Fixes (2026-04-15)
+
+### Context
+First live Railway deploy: Postgres service added, domain assigned, API key set.
+Multiple deployment errors surfaced and fixed in sequence.
+
+### Fix 1 — "Not Found" at domain root
+**Root cause**: No route registered at `/`. All routes live under `/api/v1/`.
+Hitting the Railway domain returned FastAPI's default 404.
+**Fix**: Added `GET /` in `app/main.py` returning a `RedirectResponse` to `/api/v1/`.
+
+### Fix 2 — asyncpg missing from requirements.txt
+**Root cause**: `asyncpg` was never added to `requirements.txt`. `aiosqlite` was present
+for SQLite but asyncpg (required for PostgreSQL) was absent.
+**Error**: `ModuleNotFoundError: No module named 'asyncpg'` at container start.
+**Fix**: Added `asyncpg==0.29.0` to `requirements.txt`.
+
+### Fix 3 — DATABASE_URL format mismatch
+**Root cause**: Railway's Postgres plugin provides `DATABASE_URL` as `postgresql://...`
+(or `postgres://...`). SQLAlchemy + asyncpg requires `postgresql+asyncpg://...`.
+**Fix**: Added a `@field_validator("database_url", mode="before")` in `app/config.py`
+that rewrites both `postgres://` and `postgresql://` prefixes to `postgresql+asyncpg://`
+automatically at Settings instantiation. No env var change needed on Railway.
+
+### Fix 4 — Embedding model download blocking healthcheck
+**Root cause**: `SentenceTransformer('all-MiniLM-L6-v2')` downloads ~90 MB from
+HuggingFace at container startup. This blocked the lifespan event before any HTTP
+traffic could be served. Railway's healthcheck window is 5 minutes — slow Railway
+infra or rate-limited HF could kill the container before `/health` ever responded.
+**Fix**: Pre-download the model during Docker build:
+```dockerfile
+ENV HF_HOME=/app/.hf_cache
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+```
+Model is baked into the image (~90 MB layer). Startup loads from disk in ~1 second.
+Docker layer is cached — only re-downloaded if requirements change.
+Also added `.hf_cache/` to `.dockerignore` to prevent local cache leaking into the build context.
+
+### Fix 5 — Pydantic protected namespace warning
+**Root cause**: `model_path` field in `Settings` clashes with Pydantic v2's `model_`
+namespace, generating a `UserWarning` on every startup/import.
+**Fix**: Added `"protected_namespaces": ()` to `model_config` in `app/config.py`.
+
+### Fix 6 — PostgreSQL connection pool
+**Root cause**: Default SQLAlchemy engine config has no `pool_pre_ping`. Railway
+recycles idle connections; without pre-ping, stale connections cause errors
+after periods of inactivity.
+**Fix**: Updated `app/database.py` engine to use:
+- `pool_pre_ping=True` for both dialects (re-verifies connection before each use)
+- `pool_size=5, max_overflow=10` for PostgreSQL
+- `connect_args={"check_same_thread": False}` for SQLite (unchanged behaviour)
+
+### Fix 7 — CORDIS download URL (404)
+**Root cause**: `CORDIS_CSV_URL` pointed to `cordis.europa.eu/data/cordis-HorizonEurope-projects.csv`
+which returns 404. The actual download is a ZIP at a different URL.
+**Correct URL**: `https://cordis.europa.eu/data/cordis-HORIZONprojects-csv.zip`
+The ZIP contains multiple CSVs; `project.csv` (46.6 MB) is the grant data file.
+**Fix**: Updated `data/ingest/ingest_cordis.py`:
+- Replaced `CORDIS_CSV_URL` with `CORDIS_ZIP_URL`
+- Rewrote `_download_csv()` to stream the ZIP into `io.BytesIO`, open it with
+  `zipfile.ZipFile`, find the entry ending in `project.csv`, and extract it to disk
+- Added `import io, zipfile`
+
+### New file — scripts/ingest_all.py
+One-shot script to populate all data sources, build FAISS index, and train model.
+Run from Railway Shell tab after first deploy:
+```
+python -m scripts.ingest_all
+```
+- Runs GOV.UK, UKRI Opportunities, UKRI GtR in sequence
+- CORDIS: checks if `source == "cordis"` rows already exist; skips download if so
+  (avoids re-downloading the 250 MB zip on repeat runs)
+- CORDIS errors are caught and logged — the rest of the script continues
+- Calls `scripts.build_index.build_index()` directly (no subprocess)
+- Runs `ml/train.py` via subprocess
+- `httpx` logger set to WARNING — suppresses per-request INFO spam
+
+### Railway deployment notes (operational)
+- **Start command**: Must be blank in Railway UI (uses Dockerfile `CMD`) or explicitly
+  `uvicorn app.main:app --host 0.0.0.0 --port $PORT`. Setting it to
+  `python -m scripts.ingest_all` causes a crash loop — the ingest fails (CORDIS 404
+  was the trigger), Railway restarts the container, ingest runs again, crashes again.
+- **Ingest must be run from the Shell tab**, not as the service start command.
+- **Postgres data persists** across redeploys. FAISS index and model.pkl do not
+  (ephemeral container filesystem). After each redeploy, run:
+  ```
+  python -m scripts.build_index   # ~20 min on CPU
+  python ml/train.py              # ~30 sec
+  ```
+  Full re-ingest only needed if grant data is stale.
+
+### Railway first-deploy data status (2026-04-15)
+| Source           | Records | Status                          |
+|------------------|---------|---------------------------------|
+| govuk            | 107     | Ingested                        |
+| ukri_opportunity | 114     | Ingested                        |
+| ukri_gtr         | 5,000   | Ingested                        |
+| cordis           | 0       | Pending (URL fix now applied)   |
+| **Total**        | **5,221** | FAISS build in progress       |
+
+FAISS index: encoding 5,221 grants at ~3 min/batch of 256 on Railway CPU (~60 min total).
+Model: will be trained automatically after FAISS build completes.
+
