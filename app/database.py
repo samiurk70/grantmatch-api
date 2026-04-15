@@ -8,12 +8,18 @@ from app.config import get_settings
 
 settings = get_settings()
 
+_is_postgres = "postgresql" in settings.database_url
+
 engine = create_async_engine(
     settings.database_url,
     echo=False,
-    # Keep a small pool for the async SQLite driver; for PostgreSQL these
-    # defaults are overridden by the connection pool settings in the URL.
-    connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
+    pool_pre_ping=True,  # re-verify connections before use; handles Railway's idle-connection recycling
+    **({
+        "pool_size": 5,
+        "max_overflow": 10,
+    } if _is_postgres else {
+        "connect_args": {"check_same_thread": False},
+    }),
 )
 
 AsyncSessionLocal = async_sessionmaker(

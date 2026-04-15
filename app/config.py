@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     gtr_api_base: str = "https://gtr.ukri.org/gtr/api"
     ukri_opportunities_url: str = "https://www.ukri.org/opportunity/"
 
-    model_config = {"env_file": ".env"}
+    model_config = {"env_file": ".env", "protected_namespaces": ()}
 
 
 @lru_cache
