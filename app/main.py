@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 
 from app.database import create_all_tables
 from app.api.routes import router
@@ -44,6 +45,12 @@ app.add_middleware(
 )
 
 app.include_router(router, prefix="/api/v1")
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    """Redirect bare domain root to the API info endpoint."""
+    return RedirectResponse(url="/api/v1/")
 
 
 @app.get("/health", tags=["meta"])
