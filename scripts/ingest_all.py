@@ -1,21 +1,23 @@
 """
-Populate the database from all web-scrapable sources, build the FAISS index,
-and train the XGBoost reranker — in one shot.
+Populate the database from all sources, build the FAISS index, and train the
+XGBoost reranker — in one shot.
 
 Usage (from project root):
     python -m scripts.ingest_all
 
-Sources included (no manual downloads needed):
-  - GOV.UK Find a Grant       ~107 records
-  - UKRI Opportunities        ~114 records
-  - UKRI Gateway to Research  ~5,000 records  (paginates API, takes ~5 min)
+Sources:
+  - GOV.UK Find a Grant        ~107 records  (web scrape)
+  - UKRI Opportunities         ~114 records  (web scrape)
+  - UKRI Gateway to Research   ~5,000 records (API, ~5 min)
+  - CORDIS Horizon Europe      ~19,500 records (auto-downloaded CSV, ~30 min)
+    Skipped automatically if CORDIS records are already in the database.
 
-CORDIS (19,476 records) is NOT included — it requires a manual CSV download.
-Run python -m data.ingest.ingest_cordis separately if you have data/raw/project.csv.
-
-On Railway: use the Shell tab or a one-off command to run this after the first
-deploy. The Postgres database persists across redeploys; FAISS and model.pkl
-do not (ephemeral filesystem) — re-run just the index/train steps if needed.
+On Railway: run via the Shell tab after the first deploy.
+  - Postgres data persists across redeploys.
+  - FAISS index and model.pkl do not (ephemeral filesystem).
+  - To rebuild index/model after a redeploy without re-ingesting, run:
+      python -m scripts.build_index
+      python ml/train.py
 """
 from __future__ import annotations
 
@@ -25,7 +27,6 @@ import subprocess
 import sys
 
 # Silence httpx's per-request INFO logs — they flood the output.
-# Errors and warnings from httpx are still shown.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logging.basicConfig(
@@ -36,10 +37,14 @@ logger = logging.getLogger(__name__)
 
 
 async def _run_ingestion() -> None:
+    from sqlalchemy import func, select
+
     from app.database import AsyncSessionLocal, create_all_tables
+    from app.models.db_models import Grant
     from data.ingest.ingest_govuk_grants import ingest_govuk_grants
     from data.ingest.ingest_ukri_opportunities import ingest_ukri_opportunities
     from data.ingest.ingest_ukri_gtr import ingest_ukri_gtr
+    from data.ingest.ingest_cordis import ingest_cordis_csv
 
     await create_all_tables()
 
@@ -57,6 +62,25 @@ async def _run_ingestion() -> None:
         logger.info("=== UKRI Gateway to Research ===")
         n = await ingest_ukri_gtr(session)
         logger.info("UKRI GtR done: %d records", n)
+
+    async with AsyncSessionLocal() as session:
+        logger.info("=== CORDIS Horizon Europe ===")
+        # Check if CORDIS data is already loaded to avoid re-downloading
+        # the ~250 MB CSV on every subsequent run.
+        result = await session.execute(
+            select(func.count()).select_from(Grant).where(Grant.source == "cordis")
+        )
+        existing = result.scalar_one()
+        if existing > 0:
+            logger.info(
+                "CORDIS already in DB (%d records) — skipping download.", existing
+            )
+        else:
+            logger.info(
+                "No CORDIS records found — downloading CSV from cordis.europa.eu (~250 MB)."
+            )
+            n = await ingest_cordis_csv(session)
+            logger.info("CORDIS done: %d records", n)
 
 
 async def _run_build_index() -> None:
