@@ -22,7 +22,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import io
+import shutil
+import tempfile
 import zipfile
 
 import httpx
@@ -51,28 +52,45 @@ REQUEST_TIMEOUT = 120.0
 # ---------------------------------------------------------------------------
 
 async def _download_csv(dest: Path) -> None:
-    """Download the CORDIS zip, extract project.csv, and save it to *dest*."""
+    """Download the CORDIS zip, extract project.csv, and save it to *dest*.
+
+    Streams the ZIP directly to a temporary file on disk (avoids loading the
+    entire ~250 MB zip into RAM via io.BytesIO).  The extracted CSV is also
+    written in 64 KB chunks so peak RAM stays low.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Downloading CORDIS zip from %s", CORDIS_ZIP_URL)
 
-    buf = io.BytesIO()
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
-        async with client.stream("GET", CORDIS_ZIP_URL) as response:
-            response.raise_for_status()
-            async for chunk in response.aiter_bytes(chunk_size=65_536):
-                buf.write(chunk)
+    # Stream the ZIP to a temp file in the same directory so we can rename
+    # atomically at the end.
+    tmp_zip = dest.parent / "_cordis_download.zip.tmp"
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+            async with client.stream("GET", CORDIS_ZIP_URL) as response:
+                response.raise_for_status()
+                with tmp_zip.open("wb") as fout:
+                    async for chunk in response.aiter_bytes(chunk_size=65_536):
+                        fout.write(chunk)
 
-    buf.seek(0)
-    with zipfile.ZipFile(buf) as zf:
-        names = zf.namelist()
-        logger.info("Zip contents: %s", names)
-        csv_name = next((n for n in names if n.endswith("project.csv")), None)
-        if csv_name is None:
-            raise FileNotFoundError(
-                f"project.csv not found in zip. Zip contains: {names}"
-            )
-        with zf.open(csv_name) as src, dest.open("wb") as dst:
-            dst.write(src.read())
+        logger.info(
+            "Download complete (%.1f MB) — extracting project.csv…",
+            tmp_zip.stat().st_size / 1_048_576,
+        )
+
+        with zipfile.ZipFile(tmp_zip) as zf:
+            names = zf.namelist()
+            logger.info("Zip contents: %s", names)
+            csv_name = next((n for n in names if n.endswith("project.csv")), None)
+            if csv_name is None:
+                raise FileNotFoundError(
+                    f"project.csv not found in zip. Zip contains: {names}"
+                )
+            # Extract in 64 KB chunks — avoids reading the whole CSV into RAM
+            with zf.open(csv_name) as src, dest.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=65_536)
+    finally:
+        if tmp_zip.exists():
+            tmp_zip.unlink()
 
     logger.info("Extracted project.csv → %s (%.1f MB)", dest, dest.stat().st_size / 1_048_576)
 
@@ -212,39 +230,47 @@ async def ingest_cordis_csv(
     # CORDIS CSVs use semicolon separators and may have a BOM.
     # Some objective fields contain semicolons inside quoted strings that
     # confuse the C parser — use the Python engine and skip bad lines.
-    # The Python engine handles embedded semicolons in quoted fields correctly.
     # low_memory is not supported by the Python engine — omit it.
     _read_kwargs = dict(encoding="utf-8-sig", engine="python", on_bad_lines="skip")
-    try:
-        df = pd.read_csv(csv_path, sep=";", **_read_kwargs)
-        if len(df.columns) < 5:
-            raise ValueError("too few columns — try comma separator")
-    except Exception:
-        df = pd.read_csv(csv_path, sep=",", **_read_kwargs)
 
-    logger.info("CORDIS CSV loaded: %d rows, columns: %s", len(df), list(df.columns[:10]))
+    # Detect separator using a tiny probe read (5 rows) — avoids loading the
+    # full CSV into RAM just to check column count.
+    try:
+        probe = pd.read_csv(csv_path, sep=";", nrows=5, **_read_kwargs)
+        sep = ";" if len(probe.columns) >= 5 else ","
+    except Exception:
+        sep = ","
+    logger.info("Detected CSV separator: %r", sep)
+
+    # Use chunksize so pandas reads CHUNK_SIZE rows at a time instead of
+    # loading the entire ~19 K-row file into RAM as one DataFrame.
+    reader = pd.read_csv(csv_path, sep=sep, chunksize=CHUNK_SIZE, **_read_kwargs)
 
     total = 0
     skipped = 0
+    row_index = 0
 
-    for i, (_, row) in enumerate(df.iterrows()):
-        data = _build_grant(row)
-        if data is None:
-            skipped += 1
-            continue
+    for chunk in reader:
+        for _, row in chunk.iterrows():
+            data = _build_grant(row)
+            if data is None:
+                skipped += 1
+                row_index += 1
+                continue
 
-        try:
-            await _upsert(db_session, data)
-            total += 1
-        except Exception as exc:
-            logger.warning("Skipping CORDIS row %d (id=%s): %s", i, row.get("id"), exc)
-            skipped += 1
+            try:
+                await _upsert(db_session, data)
+                total += 1
+            except Exception as exc:
+                logger.warning("Skipping CORDIS row %d (id=%s): %s", row_index, row.get("id"), exc)
+                skipped += 1
 
-        if total % CHUNK_SIZE == 0 and total > 0:
-            await db_session.commit()
-            logger.info("CORDIS: upserted %d records (skipped %d).", total, skipped)
+            row_index += 1
 
-    await db_session.commit()
+        # Commit after every chunk (CHUNK_SIZE rows) — keeps transaction small
+        await db_session.commit()
+        logger.info("CORDIS: upserted %d records so far (skipped %d).", total, skipped)
+
     logger.info(
         "CORDIS ingestion complete: %d records upserted, %d skipped.", total, skipped
     )

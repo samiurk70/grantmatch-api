@@ -147,6 +147,7 @@ async def list_grants(
     funder: Optional[str] = Query(None, description="Filter by funder name (partial match)"),
     sector: Optional[str] = Query(None, description="Filter by sector tag"),
     limit: int = Query(20, ge=1, le=50, description="Number of results (max 50)"),
+    offset: int = Query(0, ge=0, description="Number of results to skip (for pagination)"),
     db: AsyncSession = Depends(get_db),
     _: str = Depends(verify_api_key),
 ) -> list[GrantSummary]:
@@ -158,7 +159,9 @@ async def list_grants(
     if funder:
         q = q.where(Grant.funder.ilike(f"%{funder}%"))
 
-    q = q.order_by(Grant.deadline.asc().nulls_last()).limit(limit)
+    # Primary sort by deadline (soonest first, NULLs last); secondary sort by
+    # id keeps the order fully deterministic when deadlines are equal or absent.
+    q = q.order_by(Grant.deadline.asc().nulls_last(), Grant.id.asc()).limit(limit).offset(offset)
 
     result = await db.execute(q)
     grants = result.scalars().all()
