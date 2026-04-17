@@ -472,3 +472,133 @@ python -m scripts.ingest_all
 FAISS index: encoding 5,221 grants at ~3 min/batch of 256 on Railway CPU (~60 min total).
 Model: will be trained automatically after FAISS build completes.
 
+---
+
+## Session 7 — Memory Fixes, Local Build Strategy & Production Verification (2026-04-16)
+
+### Context
+Railway free tier (1 GB RAM, 2 CPU cores) ran out of memory during
+`python -m scripts.build_index` (crashed at ~4352/24699 grants) and
+during CORDIS ingestion (ZIP buffered entirely in RAM). Also, the
+`/api/v1/grants` listing returned grants in non-deterministic order.
+
+### Fix 1 — scripts/build_index.py: OOM on Railway (primary culprit)
+**Root cause**: `list(result.scalars().all())` loaded all 24,699 full
+Grant ORM objects (21 columns including long CORDIS descriptions) into
+a Python list before encoding started.  Then `all_vectors` accumulated
+every batch's numpy array before a single `np.vstack()` at the end.
+Peak RAM = model (~100 MB) + all ORM objects (~150 MB) + full vector
+matrix (~37 MB) + Python overhead → easily exceeded 1 GB.
+
+**Fix**:
+- Offset-based batch loop: `SELECT id, title, description … LIMIT 128
+  OFFSET n` — only 3 columns, 128 rows in RAM per iteration.
+- `BATCH_SIZE` reduced from 256 → 128 (halves encoding activation peak).
+- FAISS `id_index.add_with_ids()` called per batch (incremental) instead
+  of one `np.vstack` at the end.
+- Bulk DB update via `execute(update(Grant), [{…}])` per batch — avoids
+  individual UPDATE round-trips.
+- `dim` derived from a single dummy encode before the loop so
+  `IndexFlatIP(dim)` is constructed before any real data is processed.
+
+### Fix 2 — data/ingest/ingest_cordis.py: ZIP buffered in RAM
+**Root cause 1 — io.BytesIO**: The entire ~250 MB ZIP was streamed into
+`io.BytesIO()` in RAM before extraction.
+**Fix**: Stream ZIP bytes directly to `_cordis_download.zip.tmp` on
+disk. Extract `project.csv` from the ZIP file (on disk) using
+`shutil.copyfileobj` in 64 KB chunks. Temp file deleted in a `finally`
+block. Peak RAM for download: ~0 MB instead of ~250 MB.
+
+**Root cause 2 — full DataFrame**: `pd.read_csv()` loaded all 19,476
+rows into a single DataFrame.
+**Fix**: Detect CSV separator with a 5-row probe read, then use
+`pd.read_csv(…, chunksize=500)` to iterate 500 rows at a time.
+DB `commit()` happens after each chunk. Full CSV never in RAM at once.
+
+### Fix 3 — app/api/routes.py: non-deterministic grant ordering
+**Root cause**: `ORDER BY deadline ASC NULLS LAST` only — the majority
+of CORDIS records have no deadline so they all landed in undefined heap
+order. No `offset` parameter meant proper pagination was impossible.
+**Fix**:
+- Added `Grant.id.asc()` as a secondary sort → fully deterministic
+  regardless of NULL deadlines.
+- Added `offset: int = Query(0, …)` parameter → clients can paginate
+  with `?limit=50&offset=50`.
+
+### Fix 4 — scripts/ingest_all.py: partial CORDIS ingest not retried
+**Root cause**: CORDIS skip check `if existing > 0` meant a
+partially-ingested run (e.g. crashed after 3,000 rows) would never
+be retried — the script saw rows and assumed completion.
+**Fix**: Added `_CORDIS_MIN_EXPECTED = 10_000` threshold. Script re-runs
+CORDIS ingestion if row count is below threshold, logging a warning
+about the interrupted prior run.
+
+### Fix 5 — .gitignore / .dockerignore / .railwayignore
+Updated all three files so `data/grants.faiss` and `ml/model.pkl` are
+**no longer excluded**:
+- `.gitignore`: Added `!ml/model.pkl` and `!data/grants.faiss` negation
+  rules after the `*.pkl` / `*.faiss` glob lines.
+- `.dockerignore` / `.railwayignore`: Removed the two lines; replaced
+  with comments explaining the intentional inclusion.
+- `.env.example`: Sanitized — real Railway internal URL that had been
+  committed was replaced with `sqlite+aiosqlite:///data/grants.db`
+  placeholder.
+
+### Local build strategy (bypasses Railway RAM limit permanently)
+Railway's 1 GB RAM cannot run `build_index.py` against 24,699 grants.
+Solution: build on local machine (i9 12th gen, RTX 4070, 40 GB DDR5),
+commit the artifacts, bake them into the Docker image.
+
+**Procedure**:
+1. Set `DATABASE_URL` in local `.env` to Railway's public PostgreSQL URL
+   (`monorail.proxy.rlwy.net:18935`).
+2. `python -m scripts.build_index` — reads Grant IDs from Railway's live
+   PostgreSQL (correct IDs), encodes all 24,699 texts on local GPU
+   (CUDA: True, RTX 4070), writes `embedding_vector` back to Railway's
+   DB, saves `data/grants.faiss` locally.
+   - Completed: 24,699 / 24,699 vectors, dim=384.
+   - SSL cleanup error on exit is cosmetic (Windows Python 3.10
+     asyncio Proactor + asyncpg SSL teardown after event loop close).
+3. `python ml/train.py` — purely synthetic data, no DB needed.
+   - Accuracy: 99.67%, Macro F1: 0.98. Saved to `ml/model.pkl`.
+4. `git add data/grants.faiss ml/model.pkl` + commit + push.
+   Railway rebuilds Docker image with both files baked in (~40 MB total).
+
+### Production verification (2026-04-16)
+```
+GET /api/v1/health → 200 OK
+{
+  "status": "ok",
+  "model_loaded": true,
+  "grants_in_db": 24699,
+  "index_built": true,
+  "last_ingestion": "2026-04-16"
+}
+```
+All endpoints confirmed live at:
+`https://grantmatch-api-production.up.railway.app`
+Swagger docs: `/docs`
+
+### Updated deployment notes
+- `data/grants.faiss` and `ml/model.pkl` are now committed to git and
+  baked into the Docker image. They persist across every redeploy with
+  zero RAM cost on Railway.
+- To refresh after a major data update: re-run the local build procedure
+  above (steps 1–4), then push. Takes ~20 min on RTX 4070.
+- Full re-ingest of grant data: still run from Railway Shell tab via
+  `python -m scripts.ingest_all` (CORDIS skip threshold now 10,000).
+- After re-ingest, must also re-run local build procedure to rebuild
+  FAISS index with updated IDs.
+
+### Live data status (2026-04-16)
+| Source           | Records | Status     |
+|------------------|---------|------------|
+| govuk            | ~107    | Ingested   |
+| ukri_opportunity | ~114    | Ingested   |
+| ukri_gtr         | 5,000   | Ingested   |
+| cordis           | ~19,478 | Ingested   |
+| **Total**        | **24,699** | **All in PostgreSQL** |
+
+FAISS index: 24,699 vectors (dim=384), baked into Docker image.
+Model: XGBoost, 99.67% accuracy, baked into Docker image.
+

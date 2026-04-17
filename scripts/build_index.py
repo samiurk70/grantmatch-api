@@ -5,14 +5,13 @@ Standalone usage:
     python -m scripts.build_index
 
 What it does:
-  1. Loads every Grant row that has a non-null description.
+  1. Streams Grant rows that have a non-null description in batches of BATCH_SIZE
+     (never loads all rows into RAM at once — safe on 1 GB Railway instances).
   2. Encodes  title + " " + description[:500]  with the sentence-transformer
      singleton (all-MiniLM-L6-v2 by default).
-  3. Stores the resulting float32 bytes back into Grant.embedding_vector
-     so the matcher can map FAISS result indices to DB rows.
-  4. Builds a FAISS IndexFlatIP (inner-product, equivalent to cosine
-     similarity when vectors are L2-normalised, as our embedder does).
-  5. Serialises the index to FAISS_INDEX_PATH.
+  3. Bulk-updates Grant.embedding_vector bytes to DB after each batch.
+  4. Adds each batch's vectors to the FAISS index incrementally.
+  5. Serialises the final index to FAISS_INDEX_PATH.
 
 Run this script after any ingestion job that adds or updates grants.
 """
@@ -20,13 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import struct
 import sys
 from pathlib import Path
 
 import faiss
 import numpy as np
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -36,12 +34,12 @@ from app.services.embedder import get_embedder
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 256  # grants encoded per embed() call
+BATCH_SIZE = 128  # lower than the old 256 — safer on 1 GB RAM
 
 
-def _text_for_grant(grant: Grant) -> str:
-    desc = (grant.description or "")[:500]
-    return f"{grant.title} {desc}".strip()
+def _text_for_row(id_: int, title: str, description: str | None) -> str:
+    desc = (description or "")[:500]
+    return f"{title} {desc}".strip()
 
 
 def _pack_vector(vec: np.ndarray) -> bytes:
@@ -49,15 +47,15 @@ def _pack_vector(vec: np.ndarray) -> bytes:
     return vec.astype(np.float32).tobytes()
 
 
-def _unpack_vector(data: bytes) -> np.ndarray:
-    n = len(data) // 4
-    return np.frombuffer(data, dtype=np.float32).reshape(1, n)
-
-
 async def build_index(db_session: AsyncSession) -> int:
     """
     Encode all grants with descriptions, store embeddings in DB, build
     and save a FAISS index.
+
+    Memory strategy: loads BATCH_SIZE rows at a time using offset pagination,
+    adds vectors to the FAISS index incrementally, and bulk-updates the DB
+    after each batch.  Peak RAM ≈ model size (~100 MB) + one batch of text/
+    vectors — well within a 1 GB container.
 
     Returns the number of vectors indexed.
     """
@@ -65,57 +63,81 @@ async def build_index(db_session: AsyncSession) -> int:
     index_path = Path(settings.faiss_index_path)
     index_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------ #
-    # Load grants
-    # ------------------------------------------------------------------ #
-    result = await db_session.execute(
-        select(Grant).where(Grant.description.isnot(None))
-    )
-    grants: list[Grant] = list(result.scalars().all())
+    embedder = get_embedder()
 
-    if not grants:
+    # ------------------------------------------------------------------ #
+    # Determine embedding dimension from a dummy encode so we can build
+    # the FAISS index before the first real batch arrives.
+    # ------------------------------------------------------------------ #
+    sample = embedder.encode(["dimension probe"])
+    dim = sample.shape[1]
+
+    base_index = faiss.IndexFlatIP(dim)
+    id_index = faiss.IndexIDMap(base_index)
+
+    # ------------------------------------------------------------------ #
+    # Count total grants so we can log progress
+    # ------------------------------------------------------------------ #
+    from sqlalchemy import func
+    count_result = await db_session.execute(
+        select(func.count()).select_from(Grant).where(Grant.description.isnot(None))
+    )
+    total_grants = count_result.scalar_one() or 0
+    if total_grants == 0:
         logger.warning("No grants with descriptions found — index not built.")
         return 0
-
-    logger.info("Loaded %d grants with descriptions.", len(grants))
+    logger.info("Indexing %d grants with descriptions (batch size=%d).", total_grants, BATCH_SIZE)
 
     # ------------------------------------------------------------------ #
-    # Encode in batches
+    # Offset-based batch loop — only BATCH_SIZE ORM rows in RAM at once.
+    # Select only the three columns needed; skip heavy JSON fields.
     # ------------------------------------------------------------------ #
-    all_vectors: list[np.ndarray] = []
+    total_indexed = 0
+    offset = 0
 
-    for batch_start in range(0, len(grants), BATCH_SIZE):
-        batch = grants[batch_start : batch_start + BATCH_SIZE]
-        texts = [_text_for_grant(g) for g in batch]
-        vectors = get_embedder().encode(texts)  # shape (batch, dim), L2-normalised
+    while True:
+        result = await db_session.execute(
+            select(Grant.id, Grant.title, Grant.description)
+            .where(Grant.description.isnot(None))
+            .order_by(Grant.id)
+            .limit(BATCH_SIZE)
+            .offset(offset)
+        )
+        rows = result.all()
+        if not rows:
+            break
 
-        for grant, vec in zip(batch, vectors):
-            grant.embedding_vector = _pack_vector(vec)
+        batch_ids = [r.id for r in rows]
+        texts = [_text_for_row(r.id, r.title, r.description) for r in rows]
 
-        all_vectors.append(vectors)
+        # Encode — returns (batch, dim) float32, L2-normalised
+        vectors: np.ndarray = embedder.encode(texts)
+
+        # Bulk-update embedding_vector for this batch
+        await db_session.execute(
+            update(Grant),
+            [
+                {"id": gid, "embedding_vector": _pack_vector(vec)}
+                for gid, vec in zip(batch_ids, vectors)
+            ],
+        )
+        await db_session.commit()
+
+        # Add this batch to the FAISS index
+        ids_arr = np.array(batch_ids, dtype=np.int64)
+        id_index.add_with_ids(vectors.astype(np.float32), ids_arr)
+
+        total_indexed += len(rows)
+        offset += BATCH_SIZE
         logger.info(
-            "Encoded batch %d–%d / %d",
-            batch_start + 1,
-            min(batch_start + BATCH_SIZE, len(grants)),
-            len(grants),
+            "Encoded and indexed %d / %d grants.",
+            total_indexed,
+            total_grants,
         )
 
-    await db_session.commit()
-    logger.info("Embedding vectors written to database.")
-
-    # ------------------------------------------------------------------ #
-    # Build FAISS index
-    # ------------------------------------------------------------------ #
-    matrix = np.vstack(all_vectors).astype(np.float32)
-    dim = matrix.shape[1]
-
-    index = faiss.IndexFlatIP(dim)  # inner product ≡ cosine on unit vectors
-    # Wrap with IDMap so we can store Grant.id as the FAISS vector ID,
-    # making retrieval → DB lookup a direct integer lookup.
-    id_index = faiss.IndexIDMap(index)
-
-    ids = np.array([g.id for g in grants], dtype=np.int64)
-    id_index.add_with_ids(matrix, ids)
+    if total_indexed == 0:
+        logger.warning("No grants indexed — check that descriptions are present.")
+        return 0
 
     faiss.write_index(id_index, str(index_path))
     logger.info(

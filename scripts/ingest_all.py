@@ -71,14 +71,25 @@ async def _run_ingestion() -> None:
             select(func.count()).select_from(Grant).where(Grant.source == "cordis")
         )
         existing = result.scalar_one()
-        if existing > 0:
+        # Re-run if the table is empty OR if a previous run was killed partway
+        # through (e.g. OOM) leaving fewer than 10 000 CORDIS rows.
+        _CORDIS_MIN_EXPECTED = 10_000
+        if existing >= _CORDIS_MIN_EXPECTED:
             logger.info(
                 "CORDIS already in DB (%d records) — skipping download.", existing
             )
         else:
-            logger.info(
-                "No CORDIS records found — downloading zip from cordis.europa.eu."
-            )
+            if existing > 0:
+                logger.warning(
+                    "Only %d CORDIS records found (expected ≥ %d) — "
+                    "previous run may have been interrupted. Re-running ingestion.",
+                    existing,
+                    _CORDIS_MIN_EXPECTED,
+                )
+            else:
+                logger.info(
+                    "No CORDIS records found — downloading zip from cordis.europa.eu."
+                )
             try:
                 n = await ingest_cordis_csv(session)
                 logger.info("CORDIS done: %d records", n)
