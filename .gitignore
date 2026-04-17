@@ -18,3 +18,9 @@ build/
 .venv/
 venv/
 *.log
+
+# Local / agent context — keep out of git (still readable in workspace)
+CLAUDE.md
+web/CLAUDE.md
+Instructions for Web-App.txt
+PROGRESS.md
