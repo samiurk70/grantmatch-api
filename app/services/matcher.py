@@ -19,7 +19,7 @@ from app.utils.feature_extractor import extract_features
 
 logger = logging.getLogger(__name__)
 
-_CANDIDATE_POOL = 50   # top-K from FAISS before reranking
+_CANDIDATE_POOL = 150  # top-K from FAISS before reranking (wider pool → more score variance)
 _FALLBACK_POOL  = 50   # random grants when FAISS unavailable
 
 
@@ -169,12 +169,23 @@ class GrantMatcher:
     ) -> tuple[list[int], dict[int, float]]:
         distances, ids = self.index.search(query_vec, _CANDIDATE_POOL)
         candidate_ids: list[int] = []
-        scores: dict[int, float] = {}
+        raw: dict[int, float] = {}
         for dist, gid in zip(distances[0], ids[0]):
             if gid == -1:   # FAISS padding for short indexes
                 continue
             candidate_ids.append(int(gid))
-            scores[int(gid)] = float(max(0.0, dist))   # inner-product score
+            raw[int(gid)] = float(max(0.0, dist))
+
+        # Min-max normalise across the pool so scores span [0.05, 1.0].
+        # Raw inner-product scores from the top-150 cluster tightly (e.g. 0.40–0.49),
+        # which collapses score variance in the reranker. Spreading them out preserves
+        # relative ordering while giving the heuristic meaningful discrimination.
+        scores: dict[int, float] = {}
+        if raw:
+            lo = min(raw.values())
+            hi = max(raw.values())
+            spread = hi - lo if hi > lo else 1.0
+            scores = {gid: 0.05 + 0.95 * (v - lo) / spread for gid, v in raw.items()}
         return candidate_ids, scores
 
     async def _db_fallback(

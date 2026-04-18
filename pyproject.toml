@@ -1,0 +1,16 @@
+# Aligns `uv` (e.g. Vercel monorepo detection) with `.python-version` (3.11.x).
+# Runtime dependencies for the API live in requirements.txt (Docker / Railway).
+# If you previously had requires-python = "==3.12.*" here, that caused:
+#   uv sync … incompatible with .python-version (3.11.9)
+
+[project]
+name = "grantmatch-api"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+description = "GrantMatch API — install deps with pip -r requirements.txt or Docker"
+readme = "README.md"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

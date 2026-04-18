@@ -40,8 +40,11 @@ def check_eligibility(grant: Grant, profile: ApplicantProfile) -> EligibilityVer
       "likely_eligible"   — passes all checks
     """
     # --- Organisation type ---
+    # Downgraded from hard "ineligible" to "check_required" because real grant records
+    # often have incomplete eligibility_org_types data (especially CORDIS/GtR), causing
+    # false hard-drops for valid applicant types like charity and individual.
     if grant.eligibility_org_types and profile.organisation_type not in grant.eligibility_org_types:
-        return "likely_ineligible"
+        return "check_required"
 
     # --- Region ---
     if grant.eligibility_regions and not _location_compatible(

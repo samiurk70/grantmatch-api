@@ -14,6 +14,11 @@ from app.utils.feature_extractor import FEATURE_NAMES, features_to_array
 
 logger = logging.getLogger(__name__)
 
+# The XGBoost model was trained on 30 synthetic grants and outputs near-constant
+# probabilities (~0.78) on all real inputs, collapsing score variance.
+# Set to True only after retraining on real production grant data.
+_MODEL_ENABLED = False
+
 # Weights for the heuristic scorer — must sum to 100
 _HEURISTIC_WEIGHTS: dict[str, float] = {
     "semantic_similarity": 40.0,
@@ -109,7 +114,7 @@ class GrantReranker:
         Without:    score = weighted sum of features (max 100),
                     factors derived from feature contributions.
         """
-        if self.model is not None:
+        if self.model is not None and _MODEL_ENABLED:
             return self._model_score(features)
         return self._heuristic_score(features)
 
@@ -131,8 +136,10 @@ class GrantReranker:
     ) -> tuple[float, list[FactorExplanation]]:
         X = features_to_array(features).reshape(1, -1)
         try:
-            prob = float(self.model.predict_proba(X)[0, 1])
-            score = round(prob * 100.0, 2)
+            probs = self.model.predict_proba(X)[0]  # shape: (n_classes,)
+            # Weighted expected value: labels 0=irrelevant → 3=strong, scaled to 0–100.
+            n = len(probs)
+            score = round(float(sum(i / (n - 1) * p for i, p in enumerate(probs))) * 100.0, 2)
         except AttributeError:
             # Fallback if model has no predict_proba (e.g. regressor)
             raw = float(self.model.predict(X)[0])
