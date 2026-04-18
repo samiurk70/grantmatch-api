@@ -42,18 +42,8 @@ GrantMatch is a full-stack ML application that scores every UK and EU grant oppo
 ![Landing page](docs/screenshots/landing.png)
 
 **Landing page** — hero, stats bar, how it works, who it's for, pricing
-
-</td>
-<td width="50%">
-
-<!-- Replace with: docs/screenshots/demo-form.png -->
-![Demo search form](docs/screenshots/demo-form.png)
-
-**Demo search form** — iOS liquid-glass design, sector tags, TRL slider
-
-</td>
-</tr>
 <tr>
+</td>
 <td width="50%">
 
 <!-- Replace with: docs/screenshots/results.png -->
@@ -62,9 +52,7 @@ GrantMatch is a full-stack ML application that scores every UK and EU grant oppo
 **Ranked results** — score ring, eligibility verdict, expandable factors
 
 </td>
-<td width="50%">
-
----
+</table>
 
 ## Architecture
 
