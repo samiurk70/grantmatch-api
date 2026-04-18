@@ -64,17 +64,6 @@ GrantMatch is a full-stack ML application that scores every UK and EU grant oppo
 </td>
 <td width="50%">
 
-<!-- Replace with: docs/screenshots/mobile.png -->
-![Mobile view](docs/screenshots/mobile.png)
-
-**Mobile** — fully responsive down to 320px, hamburger nav, touch targets
-
-</td>
-</tr>
-</table>
-
-> **Adding screenshots**: take a full-page screenshot of each view, save to `docs/screenshots/`, and the images will render automatically above.
-
 ---
 
 ## Architecture
@@ -313,42 +302,6 @@ curl -s -X POST https://grantmatch-api-production.up.railway.app/api/v1/match \
 
 ---
 
-## Web App
-
-The frontend lives in a separate repository: **[github.com/samiurk70/grantmatch-web](https://github.com/samiurk70/grantmatch-web)**
-
-Built with **Next.js 16**, **Tailwind CSS v4**, **Framer Motion**, and **shadcn/ui**. Deployed to **Vercel**.
-
-### Pages
-
-| Route | Description |
-|-------|-------------|
-| `/` | Landing page — hero, how it works, who it's for, pricing |
-| `/demo` | Interactive grant search — form + live results via the API |
-| `/docs` | API documentation |
-| `/pricing` | Tier comparison |
-
-### Design system — iOS Liquid Glass
-
-The UI uses a custom CSS design system inspired by iOS glass morphism:
-
-- `backdrop-filter: blur(24px) saturate(180%)` — frosted glass panels
-- Animated gradient orbs — three drifting blobs create the deep-space background
-- Spring physics — `cubic-bezier(0.34, 1.56, 0.64, 1)` for hover lifts
-- Score rings — animated SVG circles coloured green / amber / red by score
-- Fully responsive — 320px iPhone SE to 4K monitor
-
-### Next.js API proxy (`/api/match`)
-
-The web app never exposes the Railway API key to the browser. All match requests go through a server-side Next.js route handler at `/api/match` that:
-
-1. Validates the request
-2. Enforces a 10 req/min in-memory rate limit per IP
-3. Forwards to Railway with the `X-API-Key` header
-4. Returns the response (or a `429` / `502` if rate-limited / unavailable)
-
----
-
 ## Local Development
 
 ### Prerequisites
@@ -383,22 +336,6 @@ python ml/train.py
 uvicorn app.main:app --reload
 # → http://localhost:8000
 # → http://localhost:8000/docs  (Swagger UI)
-```
-
-### Web app setup
-
-```bash
-git clone https://github.com/samiurk70/grantmatch-web.git
-cd grantmatch-web
-
-npm install
-
-# Create .env.local
-echo "GRANTMATCH_API_URL=http://localhost:8000" >> .env.local
-echo "GRANTMATCH_API_KEY=changeme"             >> .env.local
-
-npm run dev
-# → http://localhost:3000
 ```
 
 ### Docker (API only)
