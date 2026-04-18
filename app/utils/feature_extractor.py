@@ -24,7 +24,7 @@ _UK_LOCATIONS = frozenset(["uk", "england", "scotland", "wales", "northern_irela
 
 def _sector_jaccard(profile_sectors: list[str], grant_sectors: list | None) -> float:
     if not grant_sectors or not profile_sectors:
-        return 0.0
+        return 0.5   # unknown → neutral (same logic as org_type and trl)
     a, b = set(profile_sectors), set(grant_sectors)
     union = a | b
     return len(a & b) / len(union) if union else 0.0
