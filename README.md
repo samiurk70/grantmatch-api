@@ -484,6 +484,32 @@ The web app auto-deploys from the `grantmatch-web` repo on every push to `main`.
 3. Run tests: `pytest tests/`
 4. Open a pull request against `master`
 
+Before you open a PR, skim the Security section so nothing sensitive ends up in git history.
+
+---
+
+## Security
+
+This project talks to a real database and uses API keys in production. A few habits keep that safe.
+
+Keep secrets out of the repo. `.env` stays gitignored; only `.env.example` should show shape, not values. Put real `DATABASE_URL`, `API_KEY`, and any host keys in Railway or Vercel, not in commits or screenshots.
+
+The browser should never see your Railway API key. The Next.js app on Vercel should read `GRANTMATCH_API_KEY` on the server and attach `X-API-Key` when it calls the API. Do not call the Railway URL directly from client-side code in production.
+
+README examples use placeholders like `YOUR_API_KEY` and generic Postgres URLs on purpose. If a PR shows something that looks like a live hostname and password, treat it as a leak and fix it before merge.
+
+If something sensitive was pushed, rotate the key in the provider dashboard first. Assume anything that hit the remote is compromised. GitHub’s secret scanning and push protection on the repo (and on forks) catch a lot of accidental commits; turning them on is worth a minute.
+
+For security bugs, please use [GitHub Security Advisories](https://github.com/samiurk70/grantmatch-api/security/advisories/new) or contact the maintainer privately instead of filing a public issue.
+
+---
+
+## License
+
+Code in this repository is released under the MIT License. See [LICENSE](LICENSE) for the full text. You may use, modify, and redistribute it as long as you keep the copyright notice and license attached.
+
+Grant text and metadata ingested into GrantMatch come from public sources (UKRI, GOV.UK, CORDIS, and related programmes). Their own terms and attribution requirements still apply to that data; this license covers the software and your original contributions, not a blanket claim over third party datasets.
+
 ---
 
 <div align="center">
